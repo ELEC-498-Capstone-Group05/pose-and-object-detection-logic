@@ -184,6 +184,8 @@ def get_action_color(action_label):
         "Running": (0, 165, 255),      # Orange
         "Walking": (147, 20, 255),     # Pink
         "Fighting": (0, 0, 255),       # Red
+        "Punching": (0, 128, 255),     # Orange-Red
+        "Kicking": (255, 0, 127),      # Deep Pink
         "Idle": (0, 255, 0),           # Green
         "Unknown": (128, 128, 128),    # Gray
     }
@@ -213,6 +215,9 @@ class TemporalActionRecognizer:
         # Buffer to store keypoint history (deque for efficient operations)
         self.keypoint_buffer = deque(maxlen=window_size)
         
+        # Buffer to store recent attack types for combo detection
+        self.attack_history = deque(maxlen=45) # 1.5 seconds history
+
         # Minimum frames needed for temporal analysis
         self.min_frames = 10
 
@@ -390,12 +395,11 @@ class TemporalActionRecognizer:
         _, _, right_wrist_speed = self._get_keypoint_velocity(KEYPOINT_RIGHT_WRIST, num_frames=3)
         
         # Check total displacement to filter out jitter/noise
-        left_disp = self._get_keypoint_displacement(KEYPOINT_LEFT_WRIST, num_frames=5)
-        right_disp = self._get_keypoint_displacement(KEYPOINT_RIGHT_WRIST, num_frames=5)
-
+        left_disp = self._get_keypoint_displacement(KEYPOINT_LEFT_WRIST, num_frames=3)
+        right_disp = self._get_keypoint_displacement(KEYPOINT_RIGHT_WRIST, num_frames=3)
         # Higher threshold to reduce false positives
-        strike_threshold = 2.0
-        displacement_threshold = 0.1
+        strike_threshold = 1.75
+        displacement_threshold = 0.08
 
         left_strike = left_wrist_speed > strike_threshold and left_disp > displacement_threshold
         right_strike = right_wrist_speed > strike_threshold and right_disp > displacement_threshold
@@ -452,8 +456,31 @@ class TemporalActionRecognizer:
             
         # 2. FIGHTING: Any rapid arm strike motion
         # maintain jumping priority over fighting
-        if static_pose == "Standing" and (self._detect_arm_strike() or self._detect_leg_kick()):
-            return "Fighting"
+        if (static_pose == "Standing" or static_pose == "Unknown"):
+            is_punching = self._detect_arm_strike()
+            is_kicking = self._detect_leg_kick()
+            
+            # Update attack history
+            if is_punching:
+                self.attack_history.append("Punching")
+            elif is_kicking:
+                self.attack_history.append("Kicking")
+            else:
+                self.attack_history.append(None)
+                
+            # Check for specific actions or compound fighting
+            has_recent_punch = "Punching" in self.attack_history
+            has_recent_kick = "Kicking" in self.attack_history
+            
+            if is_punching or is_kicking:
+                if has_recent_punch and has_recent_kick:
+                    return "Fighting"
+                if is_punching:
+                    return "Punching"
+                if is_kicking:
+                    return "Kicking"
+        else:
+             self.attack_history.append(None)
     
         # 3. RUNNING / WALKING: moving horizontally
         if static_pose == "Standing":
@@ -471,26 +498,26 @@ class TemporalActionRecognizer:
 
     def _stabilize_action(self, raw_action):
         """Stabilize the instantaneous action prediction across frames."""
-        dynamic_actions = {"Running", "Walking", "Jumping", "Fighting"}
+        dynamic_actions = {"Running", "Walking", "Jumping", "Fighting", "Punching", "Kicking"}
         static_actions = {"Standing", "Sitting", "Lying Down", "Idle"}
         
-        # Special logic for Fighting: it's an impulse action, so we hold it longer
-        # If we just detected Fighting, force it to be the current action
-        if raw_action == "Fighting":
-            self.current_action = "Fighting"
+        # Special logic for impulse actions (Fighting, Punching, Kicking): hold them longer
+        impulse_actions = {"Fighting", "Punching", "Kicking"}
+        if raw_action in impulse_actions:
+            self.current_action = raw_action
             self.frames_since_dynamic = -15  # Negative value gives it extra "stickiness" (approx 0.5s extra)
             self.action_history.append(raw_action)
-            return "Fighting"
+            return raw_action
 
         self.action_history.append(raw_action)
 
         # Logic to hold dynamic actions
-        if self.current_action == "Fighting":
+        if self.current_action in impulse_actions:
              self.frames_since_dynamic += 1
              # Use a longer hold for fighting specifically (approx 30 frames / 1 sec total)
              fighting_hold_limit = max(30, int(self.fps * 1.0)) 
              if self.frames_since_dynamic <= fighting_hold_limit:
-                 return "Fighting"
+                 return self.current_action
 
         history_dynamic = [a for a in self.action_history if a in dynamic_actions]
         if history_dynamic:
