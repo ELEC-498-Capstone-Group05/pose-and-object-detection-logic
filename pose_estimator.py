@@ -5,7 +5,7 @@ This module analyzes the 17 keypoints from MoveNet to estimate basic human poses
 and complex actions over time.
 
 Features:
-- Static pose estimation (standing, sitting, lying down)
+- Static pose estimation (standing, sitting, lying down, bending)
 - Temporal action recognition (jumping, running, walking, fighting)
 - Keypoint buffering and velocity/acceleration computation
 
@@ -112,6 +112,9 @@ def estimate_pose(keypoints, min_confidence=CONFIDENCE_THRESHOLD):
     # Need at least shoulders and hips for basic pose estimation
     if shoulder_y is None or hip_y is None:
         return "Unknown"
+     # Check for upside down: hips above shoulders
+    if hip_y < shoulder_y - 0.05:
+        return "Upside Down"
     
     # Calculate torso length (vertical distance from shoulders to hips)
     torso_length = abs(hip_y - shoulder_y)
@@ -119,36 +122,32 @@ def estimate_pose(keypoints, min_confidence=CONFIDENCE_THRESHOLD):
     hip_to_knee = None
     if knee_y is not None:
         hip_to_knee = knee_y - hip_y  # Positive means knees are below hips
+
     # Analyze pose based on body geometry
     # Remember: lower y values = higher on screen (top of image)
-    
     # Check for lying down: torso is nearly horizontal (small vertical distance)
-    if torso_length < 0.05:
-        if hip_to_knee is not None and abs(hip_to_knee) < 0.05:
-            return "Lying Down"
-        else:
-            return "Bending"
-    
-    # If hips are significantly higher than shoulders, orientation is ambiguous
-    if hip_y < shoulder_y - 0.05:
-        return "Unknown"
-    
-    # Analyze knee position relative to hips
-    if knee_y is not None:
-        # Standing: knees are significantly below hips, torso is upright
-        if hip_to_knee > 0.05:
-            if torso_length > 0.05:
-                return "Standing"
-            else:
+    if torso_length < 0.15:
+        if hip_to_knee is not None:
+            if abs(hip_to_knee) < 0.1:
+                return "Lying Down"
+            elif hip_to_knee > 0.15:
                 return "Bending"
-
-        # Sitting: knees are roughly at same level or above hips
-        # (when sitting, knees bend so they appear higher/at similar y-value to hips)
-        if hip_to_knee < 0.05 and torso_length > 0.05:
-            return "Sitting"
-
-    return "Unknown"
-
+            else:
+                return "Lying Down"
+        else:
+            return "Lying Down"
+    # Torso is more vertical - check for standing vs sitting
+    else:
+        # Analyze knee position relative to hips
+        if knee_y is not None:
+            # Standing: knees significantly below hips
+            if hip_to_knee > 0.15:
+                return "Standing"
+            # Sitting: knees are roughly at same level or above hips
+            else:
+                return "Sitting"
+        else:
+            return "Standing"
 
 def get_pose_color(pose_label):
     """
@@ -258,7 +257,7 @@ class TemporalActionRecognizer:
             num_frames: Number of recent frames to analyze
         
         Returns:
-            tuple: (vy, vx, magnitude) - velocity in y, x, and magnitude
+            tuple: (vy, vx, speed) - velocity in y, x, and scalar speed
         """
         if len(self.keypoint_buffer) < num_frames:
             return 0.0, 0.0, 0.0
@@ -266,9 +265,10 @@ class TemporalActionRecognizer:
         # Get recent positions
         recent_frames = list(self.keypoint_buffer)[-num_frames:]
         
-        # Calculate average velocity
+        # Calculate velocities
         velocities_y = []
         velocities_x = []
+        element_speeds = []
         
         for i in range(1, len(recent_frames)):
             prev_kp = recent_frames[i-1][keypoint_idx]
@@ -280,15 +280,40 @@ class TemporalActionRecognizer:
                 vx = (curr_kp[1] - prev_kp[1]) / self.dt
                 velocities_y.append(vy)
                 velocities_x.append(vx)
+                element_speeds.append(np.sqrt(vy**2 + vx**2))
         
         if not velocities_y:
             return 0.0, 0.0, 0.0
         
+        # Return average directional velocity, use MEAN speed to avoid noise spikes
         avg_vy = np.mean(velocities_y)
         avg_vx = np.mean(velocities_x)
-        magnitude = np.sqrt(avg_vy**2 + avg_vx**2)
         
-        return avg_vy, avg_vx, magnitude
+        # Use mean speed for more robust detection (original was vector magnitude)
+        speed = np.mean(element_speeds) if element_speeds else 0.0
+        
+        return avg_vy, avg_vx, speed
+    
+    def _get_keypoint_displacement(self, keypoint_idx, num_frames=5):
+        """
+        Calculate the euclidean distance between the first and last frame in the window.
+        Use this to filter out jitter where velocity is high but the point hasn't moved.
+        """
+        if len(self.keypoint_buffer) < num_frames:
+            return 0.0
+            
+        recent_frames = list(self.keypoint_buffer)[-num_frames:]
+        start_kp = recent_frames[0][keypoint_idx]
+        end_kp = recent_frames[-1][keypoint_idx]
+        
+        # Check confidence
+        if start_kp[2] < CONFIDENCE_THRESHOLD or end_kp[2] < CONFIDENCE_THRESHOLD:
+            return 0.0
+            
+        dy = end_kp[0] - start_kp[0]
+        dx = end_kp[1] - start_kp[1]
+        
+        return np.sqrt(dy**2 + dx**2)
     
     def _get_body_center_velocity(self):
         """
@@ -336,7 +361,7 @@ class TemporalActionRecognizer:
         
         return avg_vy, avg_vx, magnitude
     
-    def _are_feet_off_ground(self):
+    def _feet_are_moving_upward(self):
         """
         Detect if both ankles are moving upward (jump initiation cue).
         
@@ -353,59 +378,6 @@ class TemporalActionRecognizer:
 
         return left_vy < upward_threshold and right_vy < upward_threshold
     
-    def _detect_alternating_leg_motion(self):
-        """
-        Detect alternating leg motion (for walking/running detection).
-        
-        Returns:
-            bool: True if alternating leg motion detected
-        """
-        if len(self.keypoint_buffer) < 12:
-            return False
-        
-        recent_frames = list(self.keypoint_buffer)[-15:]
-
-        left_knee_positions = []
-        right_knee_positions = []
-
-        for frame in recent_frames:
-            left_knee = frame[KEYPOINT_LEFT_KNEE]
-            right_knee = frame[KEYPOINT_RIGHT_KNEE]
-
-            if left_knee[2] > CONFIDENCE_THRESHOLD and right_knee[2] > CONFIDENCE_THRESHOLD:
-                left_knee_positions.append(left_knee[0])
-                right_knee_positions.append(right_knee[0])
-
-        if len(left_knee_positions) < 8:
-            return False
-
-        left = np.array(left_knee_positions)
-        right = np.array(right_knee_positions)
-
-        if np.std(left) < 0.01 and np.std(right) < 0.01:
-            return False
-
-        diff = left - right
-        if np.std(diff) < 0.015:
-            return False
-
-        signs = np.sign(diff)
-        for i in range(1, len(signs)):
-            if signs[i] == 0:
-                signs[i] = signs[i - 1]
-
-        sign_changes = np.sum(signs[1:] != signs[:-1])
-        has_alternation = sign_changes >= 2
-
-        if len(left) > 1:
-            correlation = np.corrcoef(left, right)[0, 1]
-            if np.isnan(correlation):
-                correlation = 0.0
-        else:
-            correlation = 0.0
-
-        return has_alternation and correlation < 0.2
-    
     def _detect_arm_strike(self):
         """
         Detect rapid arm motion indicative of a forward strike.
@@ -413,12 +385,22 @@ class TemporalActionRecognizer:
         Returns:
             bool: True if either arm is moving rapidly enough to indicate a strike.
         """
-        _, _, left_wrist_mag = self._get_keypoint_velocity(KEYPOINT_LEFT_WRIST, num_frames=5)
-        _, _, right_wrist_mag = self._get_keypoint_velocity(KEYPOINT_RIGHT_WRIST, num_frames=5)
+        # Reduced frames to 3 to catch the peak of the punch
+        _, _, left_wrist_speed = self._get_keypoint_velocity(KEYPOINT_LEFT_WRIST, num_frames=3)
+        _, _, right_wrist_speed = self._get_keypoint_velocity(KEYPOINT_RIGHT_WRIST, num_frames=3)
+        
+        # Check total displacement to filter out jitter/noise
+        left_disp = self._get_keypoint_displacement(KEYPOINT_LEFT_WRIST, num_frames=5)
+        right_disp = self._get_keypoint_displacement(KEYPOINT_RIGHT_WRIST, num_frames=5)
 
-        strike_threshold = 1.6  # Slightly relaxed to register single-arm strikes
+        # Higher threshold to reduce false positives
+        strike_threshold = 2.0
+        displacement_threshold = 0.1
 
-        return left_wrist_mag > strike_threshold or right_wrist_mag > strike_threshold
+        left_strike = left_wrist_speed > strike_threshold and left_disp > displacement_threshold
+        right_strike = right_wrist_speed > strike_threshold and right_disp > displacement_threshold
+
+        return left_strike or right_strike
     
     def _detect_leg_kick(self):
         """
@@ -427,12 +409,21 @@ class TemporalActionRecognizer:
         Returns:
             bool: True if either leg is moving rapidly enough to indicate a kick.
         """
-        _, _, left_ankle_mag = self._get_keypoint_velocity(KEYPOINT_LEFT_ANKLE, num_frames=5)
-        _, _, right_ankle_mag = self._get_keypoint_velocity(KEYPOINT_RIGHT_ANKLE, num_frames=5)
+        _, _, left_ankle_speed = self._get_keypoint_velocity(KEYPOINT_LEFT_ANKLE, num_frames=3)
+        _, _, right_ankle_speed = self._get_keypoint_velocity(KEYPOINT_RIGHT_ANKLE, num_frames=3)
+        
+        # Check total displacement to filter out jitter/noise
+        left_disp = self._get_keypoint_displacement(KEYPOINT_LEFT_ANKLE, num_frames=5)
+        right_disp = self._get_keypoint_displacement(KEYPOINT_RIGHT_ANKLE, num_frames=5)
 
-        kick_threshold = 1.5
+        # Higher threshold to reduce false positives
+        kick_threshold = 2.0
+        displacement_threshold = 0.1
 
-        return left_ankle_mag > kick_threshold or right_ankle_mag > kick_threshold
+        left_kick = left_ankle_speed > kick_threshold and left_disp > displacement_threshold
+        right_kick = right_ankle_speed > kick_threshold and right_disp > displacement_threshold
+
+        return left_kick or right_kick
 
     def _classify_action(self, static_pose=None):
         """
@@ -448,46 +439,31 @@ class TemporalActionRecognizer:
             # Get current static pose from buffer if not provided
             current_keypoints = self.keypoint_buffer[-1]
             static_pose = estimate_pose(current_keypoints)
+        if static_pose == "Unknown":
+            return "Unknown"
         
         # Calculate body center velocity
         body_vy, body_vx, body_velocity = self._get_body_center_velocity()
         
-        # Get feet velocity
-        left_ankle_vy, left_ankle_vx, left_ankle_vel = self._get_keypoint_velocity(KEYPOINT_LEFT_ANKLE)
-        right_ankle_vy, right_ankle_vx, right_ankle_vel = self._get_keypoint_velocity(KEYPOINT_RIGHT_ANKLE)
-        avg_foot_velocity = (left_ankle_vel + right_ankle_vel) / 2
-
-        alternating_motion = self._detect_alternating_leg_motion()
-        
         # Detect specific actions (order matters - check most distinctive first)
-        
-        # 1. JUMPING: Feet off ground
-        if self._are_feet_off_ground():
-            if body_vy < -0.1:  # Negative vy = upward motion
-                return "Jumping"
+        # 1. JUMPING: Feet are moving upward rapidly and body is ascending
+        if  self._feet_are_moving_upward() and body_vy < -0.1:
+            return "Jumping"
+            
         # 2. FIGHTING: Any rapid arm strike motion
         # maintain jumping priority over fighting
-        elif self._detect_arm_strike() or self._detect_leg_kick():
+        if static_pose == "Standing" and (self._detect_arm_strike() or self._detect_leg_kick()):
             return "Fighting"
-        
-        # 3. RUNNING: High body velocity
-        if static_pose in ("Standing", "Unknown"):
-            if abs(body_vx) > 0.6:
-                #if alternating_motion or avg_foot_velocity > 0.8:
+    
+        # 3. RUNNING / WALKING: moving horizontally
+        if static_pose == "Standing":
+            if abs(body_vx) > 0.3:
                 return "Running"
-
-        # 4. WALKING: Moderate body velocity
-        if static_pose in ("Standing", "Unknown"):
-            if abs(body_vx) > 0.2:
-                #if alternating_motion or avg_foot_velocity > 0.5:
+            elif abs(body_vx) > 0.1:
                 return "Walking"
-
-        # Allow alternating motion alone to keep walking active when velocity dips slightly
-        if alternating_motion and avg_foot_velocity > 0.4 and static_pose == "Standing":
-            return "Walking"
-
-        # 5. IDLE: Minimal motion
-        if body_velocity < 0.25 and avg_foot_velocity < 0.4:
+            
+        # 4. IDLE: Minimal motion
+        if body_velocity < 0.25:
             return "Idle"
         
         # Default: return static pose or unknown
@@ -497,8 +473,24 @@ class TemporalActionRecognizer:
         """Stabilize the instantaneous action prediction across frames."""
         dynamic_actions = {"Running", "Walking", "Jumping", "Fighting"}
         static_actions = {"Standing", "Sitting", "Lying Down", "Idle"}
+        
+        # Special logic for Fighting: it's an impulse action, so we hold it longer
+        # If we just detected Fighting, force it to be the current action
+        if raw_action == "Fighting":
+            self.current_action = "Fighting"
+            self.frames_since_dynamic = -15  # Negative value gives it extra "stickiness" (approx 0.5s extra)
+            self.action_history.append(raw_action)
+            return "Fighting"
 
         self.action_history.append(raw_action)
+
+        # Logic to hold dynamic actions
+        if self.current_action == "Fighting":
+             self.frames_since_dynamic += 1
+             # Use a longer hold for fighting specifically (approx 30 frames / 1 sec total)
+             fighting_hold_limit = max(30, int(self.fps * 1.0)) 
+             if self.frames_since_dynamic <= fighting_hold_limit:
+                 return "Fighting"
 
         history_dynamic = [a for a in self.action_history if a in dynamic_actions]
         if history_dynamic:
