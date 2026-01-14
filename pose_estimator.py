@@ -53,7 +53,7 @@ def estimate_pose(keypoints, min_confidence=CONFIDENCE_THRESHOLD):
         min_confidence: minimum confidence threshold for valid keypoints
     
     Returns:
-        str: Estimated pose label - "Standing", "Sitting", "Lying Down", or "Unknown"
+        str: Estimated pose label - "Standing", "Sitting", "Lying Down", "Bending" or "Unknown"
     """
     if keypoints is None or len(keypoints) != 17:
         return "Unknown"
@@ -115,13 +115,19 @@ def estimate_pose(keypoints, min_confidence=CONFIDENCE_THRESHOLD):
     
     # Calculate torso length (vertical distance from shoulders to hips)
     torso_length = abs(hip_y - shoulder_y)
-    
+    # Calculate hip to knee distance if knees are available
+    hip_to_knee = None
+    if knee_y is not None:
+        hip_to_knee = knee_y - hip_y  # Positive means knees are below hips
     # Analyze pose based on body geometry
     # Remember: lower y values = higher on screen (top of image)
     
     # Check for lying down: torso is nearly horizontal (small vertical distance)
-    if torso_length < 0.15:
-        return "Lying Down"
+    if torso_length < 0.05:
+        if hip_to_knee is not None and abs(hip_to_knee) < 0.05:
+            return "Lying Down"
+        else:
+            return "Bending"
     
     # If hips are significantly higher than shoulders, orientation is ambiguous
     if hip_y < shoulder_y - 0.05:
@@ -129,26 +135,19 @@ def estimate_pose(keypoints, min_confidence=CONFIDENCE_THRESHOLD):
     
     # Analyze knee position relative to hips
     if knee_y is not None:
-        hip_to_knee = knee_y - hip_y  # Positive means knees are below hips
-        
         # Standing: knees are significantly below hips, torso is upright
-        if hip_to_knee > 0.15 and torso_length > 0.22:
-            if ankle_y is not None and ankle_y > knee_y:
+        if hip_to_knee > 0.05:
+            if torso_length > 0.05:
                 return "Standing"
-            return "Standing"
+            else:
+                return "Bending"
 
         # Sitting: knees are roughly at same level or above hips
         # (when sitting, knees bend so they appear higher/at similar y-value to hips)
-        if hip_to_knee < 0.12 and torso_length > 0.15:
+        if hip_to_knee < 0.05 and torso_length > 0.05:
             return "Sitting"
-    
-    # Default classification based on torso length
-    if torso_length > 0.28:
-        return "Standing"
-    elif torso_length > 0.15:
-        return "Sitting"
-    else:
-        return "Unknown"
+
+    return "Unknown"
 
 
 def get_pose_color(pose_label):
@@ -165,6 +164,7 @@ def get_pose_color(pose_label):
         "Standing": (0, 255, 0),      # Green
         "Sitting": (255, 165, 0),      # Orange
         "Lying Down": (255, 0, 255),   # Magenta
+        "Bending": (0, 128, 255),
         "Unknown": (128, 128, 128),    # Gray
     }
     return color_map.get(pose_label, (255, 255, 255))  # White as default
@@ -224,12 +224,13 @@ class TemporalActionRecognizer:
         self.dynamic_hold_frames = max(3, int(self.fps * 0.3))
         self.frames_since_dynamic = self.dynamic_hold_frames
         
-    def update(self, keypoints):
+    def update(self, keypoints, static_pose=None):
         """
         Update the buffer with new keypoints and classify the current action.
         
         Args:
             keypoints: numpy array of shape (17, 3) where each row is [y, x, confidence]
+            static_pose: Optional pre-calculated static pose label. If None, it will be calculated.
         
         Returns:
             str: Detected action label
@@ -245,7 +246,7 @@ class TemporalActionRecognizer:
             return "Unknown"
         
         # Classify action based on temporal features
-        raw_action = self._classify_action()
+        raw_action = self._classify_action(static_pose)
         return self._stabilize_action(raw_action)
     
     def _get_keypoint_velocity(self, keypoint_idx, num_frames=5):
@@ -348,7 +349,7 @@ class TemporalActionRecognizer:
         left_vy, _, _ = self._get_keypoint_velocity(KEYPOINT_LEFT_ANKLE, num_frames=4)
         right_vy, _, _ = self._get_keypoint_velocity(KEYPOINT_RIGHT_ANKLE, num_frames=4)
 
-        upward_threshold = -0.35  # Negative vy means upward motion
+        upward_threshold = -0.1  # Negative vy means upward motion
 
         return left_vy < upward_threshold and right_vy < upward_threshold
     
@@ -419,16 +420,34 @@ class TemporalActionRecognizer:
 
         return left_wrist_mag > strike_threshold or right_wrist_mag > strike_threshold
     
-    def _classify_action(self):
+    def _detect_leg_kick(self):
+        """
+        Detect rapid leg motion indicative of a kicking action.
+        
+        Returns:
+            bool: True if either leg is moving rapidly enough to indicate a kick.
+        """
+        _, _, left_ankle_mag = self._get_keypoint_velocity(KEYPOINT_LEFT_ANKLE, num_frames=5)
+        _, _, right_ankle_mag = self._get_keypoint_velocity(KEYPOINT_RIGHT_ANKLE, num_frames=5)
+
+        kick_threshold = 1.5
+
+        return left_ankle_mag > kick_threshold or right_ankle_mag > kick_threshold
+
+    def _classify_action(self, static_pose=None):
         """
         Classify the current action based on temporal features.
+        
+        Args:
+            static_pose: Optional pre-calculated static pose label.
         
         Returns:
             str: Action label
         """
-        # Get current static pose
-        current_keypoints = self.keypoint_buffer[-1]
-        static_pose = estimate_pose(current_keypoints)
+        if static_pose is None:
+            # Get current static pose from buffer if not provided
+            current_keypoints = self.keypoint_buffer[-1]
+            static_pose = estimate_pose(current_keypoints)
         
         # Calculate body center velocity
         body_vy, body_vx, body_velocity = self._get_body_center_velocity()
@@ -444,20 +463,20 @@ class TemporalActionRecognizer:
         
         # 1. JUMPING: Feet off ground
         if self._are_feet_off_ground():
-            if body_vy < -0.2:  # Negative vy = upward motion
+            if body_vy < -0.1:  # Negative vy = upward motion
                 return "Jumping"
         # 2. FIGHTING: Any rapid arm strike motion
         # maintain jumping priority over fighting
-        elif self._detect_arm_strike():
+        elif self._detect_arm_strike() or self._detect_leg_kick():
             return "Fighting"
         
-        # 3. RUNNING: High body velocity or fast feet, plus alternating legs
+        # 3. RUNNING: High body velocity
         if static_pose in ("Standing", "Unknown"):
             if abs(body_vx) > 0.6:
                 #if alternating_motion or avg_foot_velocity > 0.8:
                 return "Running"
 
-        # 4. WALKING: Moderate body velocity with alternating legs
+        # 4. WALKING: Moderate body velocity
         if static_pose in ("Standing", "Unknown"):
             if abs(body_vx) > 0.2:
                 #if alternating_motion or avg_foot_velocity > 0.5:

@@ -35,6 +35,7 @@ from pycoral.adapters import common
 from pycoral.utils.dataset import read_label_file
 from pycoral.utils.edgetpu import list_edge_tpus, make_interpreter
 from pose_estimator import estimate_pose, get_pose_color, TemporalActionRecognizer, get_action_color
+import cropping_algorithm
 
 app = Flask(__name__)
 
@@ -54,6 +55,7 @@ movenet_input_dtype = None
 movenet_input_scale = 1.0
 movenet_input_zero_point = 0
 _NUM_KEYPOINTS = 17
+crop_region = None # Init crop region state
 
 # Shared resources
 cap = None
@@ -175,7 +177,8 @@ def yolo_inference_thread():
 
 def movenet_inference_thread():
     """Runs MoveNet inference continuously on TPU 1."""
-    global latest_frame, movenet_results, inference_times, stage_times, frame_seq
+    global latest_frame, movenet_results, inference_times, stage_times, frame_seq, crop_region
+    global movenet_pose_label, movenet_action_label
 
     last_seq = -1
     
@@ -186,9 +189,25 @@ def movenet_inference_thread():
             frame = latest_frame.copy()
             last_seq = frame_seq
 
+        frame_h, frame_w, _ = frame.shape
+
+        # Determine crop region based on previous results
+        if movenet_results is None:
+            crop_region = cropping_algorithm.init_crop_region(frame_h, frame_w)
+        else:
+            # Reshape keypoints to match cropping_algorithm expectations (1, 1, 17, 3)
+            prev_keypoints = movenet_results.reshape(1, 1, 17, 3)
+            crop_region = cropping_algorithm.determine_crop_region(
+                prev_keypoints, frame_h, frame_w
+            )
+
         t0 = time.perf_counter()
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(rgb_frame, movenet_input_size, interpolation=cv2.INTER_LANCZOS4)
+        
+        # Crop and resize using the calculated region
+        resized = cropping_algorithm.crop_and_resize(
+            rgb_frame, crop_region, movenet_input_size
+        )
 
         # Feed the interpreter in its expected input dtype.
         if movenet_input_dtype is None:
@@ -215,16 +234,29 @@ def movenet_inference_thread():
         stage_times['movenet_invoke'] = invoke_ms
 
         t2 = time.perf_counter()
-        pose = common.output_tensor(movenet_interpreter, 0).copy().reshape(_NUM_KEYPOINTS, 3)
-        movenet_results = pose
+        pose_local = common.output_tensor(movenet_interpreter, 0).copy().reshape(_NUM_KEYPOINTS, 3)
         
-        # Estimate pose from keypoints
-        global movenet_pose_label, movenet_action_label
-        movenet_pose_label = estimate_pose(pose)
+        # Estimate pose from local (cropped) keypoints for better scale invariance
+        movenet_pose_label = estimate_pose(pose_local)
         
-        # Detect action using temporal features
+        # Convert local keypoints to global coordinates
+        pose_global = np.copy(pose_local)
+        for idx in range(_NUM_KEYPOINTS):
+            pose_global[idx, 0] = (
+                crop_region['y_min'] * frame_h +
+                crop_region['height'] * frame_h *
+                pose_local[idx, 0]) / frame_h
+            pose_global[idx, 1] = (
+                crop_region['x_min'] * frame_w +
+                crop_region['width'] * frame_w *
+                pose_local[idx, 1]) / frame_w
+        
+        # Update global results for drawing
+        movenet_results = pose_global
+        
+        # Detect action using temporal features (using global keypoints for consistency)
         if action_recognizer is not None:
-            movenet_action_label = action_recognizer.update(pose)
+             movenet_action_label = action_recognizer.update(pose_global, static_pose=movenet_pose_label)
         
         stage_times['movenet_post'] = (time.perf_counter() - t2) * 1000
 
@@ -618,17 +650,41 @@ def main():
     movenet_input_zero_point = q[1] if q and len(q) > 1 else 0
     
     print(f"MoveNet model loaded. Input size: {movenet_input_size}")
+    
+    # Initialize crop region
+    global crop_region
+    # We don't have image dims yet, so leave as None, will init in loop
+    crop_region = None
 
-    # Open camera
-    cap = cv2.VideoCapture(args.camera_idx)
-    if not cap.isOpened():
-        print(f"Error: Could not open camera {args.camera_idx}")
+    # Open camera - try multiple indices if the specified one fails
+    camera_indices_to_try = [args.camera_idx] + [i for i in range(10) if i != args.camera_idx]
+    cap = None
+    successful_camera_idx = None
+    
+    for idx in camera_indices_to_try:
+        print(f"Trying camera index {idx}...")
+        test_cap = cv2.VideoCapture(idx)
+        if test_cap.isOpened():
+            # Verify we can actually read a frame
+            ret, _ = test_cap.read()
+            if ret:
+                cap = test_cap
+                successful_camera_idx = idx
+                print(f"Successfully opened camera {idx}")
+                break
+            else:
+                test_cap.release()
+        else:
+            test_cap.release()
+    
+    if cap is None or not cap.isOpened():
+        print(f"Error: Could not open any camera (tried indices: {camera_indices_to_try[:5]})")
         return
 
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30  # Default to 30 if not available
-    print(f"Camera opened: {width}x{height} @ {fps} FPS")
+    print(f"Camera {successful_camera_idx} opened: {width}x{height} @ {fps} FPS")
     
     # Initialize temporal action recognizer
     action_recognizer = TemporalActionRecognizer(window_size=30, fps=fps)
