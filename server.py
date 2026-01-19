@@ -36,6 +36,7 @@ from pycoral.adapters import common
 from pycoral.utils.dataset import read_label_file
 from pycoral.utils.edgetpu import list_edge_tpus, make_interpreter
 from pose_estimator import estimate_pose, get_pose_color, TemporalActionRecognizer, get_action_color
+from object_detector import ObjectDetector
 import cropping_algorithm
 
 app = Flask(__name__)
@@ -46,11 +47,8 @@ log.setLevel(logging.ERROR)
 
 # Global variables for YOLO
 yolo_interpreter = None
+yolo_detector = None
 yolo_input_size = None
-yolo_input_scale = 1.0
-yolo_input_zero_point = 0
-yolo_output_scale = 1.0
-yolo_output_zero_point = 0
 yolo_labels = {}
 
 # Global variables for MoveNet
@@ -85,65 +83,9 @@ stage_times = {
     'frame_total': 0.0,
 }
 
-def non_max_suppression(boxes, scores, threshold):
-    """Performs Non-Maximum Suppression (NMS) on the boxes."""
-    if len(boxes) == 0:
-        return []
-
-    x1 = boxes[:, 0] - boxes[:, 2] / 2
-    y1 = boxes[:, 1] - boxes[:, 3] / 2
-    x2 = boxes[:, 0] + boxes[:, 2] / 2
-    y2 = boxes[:, 1] + boxes[:, 3] / 2
-
-    areas = (x2 - x1) * (y2 - y1)
-    order = scores.argsort()[::-1]
-
-    keep = []
-    while order.size > 0:
-        i = order[0]
-        keep.append(i)
-        
-        xx1 = np.maximum(x1[i], x1[order[1:]])
-        yy1 = np.maximum(y1[i], y1[order[1:]])
-        xx2 = np.minimum(x2[i], x2[order[1:]])
-        yy2 = np.minimum(y2[i], y2[order[1:]])
-
-        w = np.maximum(0.0, xx2 - xx1)
-        h = np.maximum(0.0, yy2 - yy1)
-        inter = w * h
-        ovr = inter / (areas[i] + areas[order[1:]] - inter)
-
-        inds = np.where(ovr <= threshold)[0]
-        order = order[inds + 1]
-
-    return keep
-
-def process_yolo_output(output, conf_threshold=0.40, iou_threshold=0.45):
-    """Processes YOLO output tensor."""
-    output = output.transpose((0, 2, 1))
-    pred = output[0]
-    
-    boxes = pred[:, :4]
-    scores = pred[:, 4:]
-    
-    class_ids = np.argmax(scores, axis=1)
-    max_scores = np.max(scores, axis=1)
-    
-    mask = max_scores > conf_threshold
-    boxes = boxes[mask]
-    class_ids = class_ids[mask]
-    max_scores = max_scores[mask]
-    
-    if len(boxes) == 0:
-        return [], [], []
-
-    keep = non_max_suppression(boxes, max_scores, iou_threshold)
-    
-    return boxes[keep], class_ids[keep], max_scores[keep]
-
 def yolo_inference_thread():
     """Runs YOLO inference continuously on TPU 0."""
-    global latest_frame, yolo_results, inference_times, stage_times, frame_seq
+    global latest_frame, yolo_results, inference_times, stage_times, frame_seq, yolo_detector
 
     last_seq = -1
     
@@ -154,31 +96,12 @@ def yolo_inference_thread():
             frame = latest_frame.copy()
             last_seq = frame_seq
 
-        t0 = time.perf_counter()
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        resized = cv2.resize(rgb_frame, yolo_input_size, interpolation=cv2.INTER_NEAREST)
-
-        # Keep the existing quantization behavior (float->int8) but avoid PIL.
-        input_data = resized.astype(np.float32) / 255.0
-        input_data = (input_data / yolo_input_scale) + yolo_input_zero_point
-        input_data = np.clip(np.rint(input_data), -128, 127).astype(np.int8)
-        stage_times['yolo_pre'] = (time.perf_counter() - t0) * 1000
-
-        common.set_input(yolo_interpreter, input_data)
-
-        t1 = time.perf_counter()
-        yolo_interpreter.invoke()
-        invoke_ms = (time.perf_counter() - t1) * 1000
-        inference_times['yolo'] = invoke_ms
-        stage_times['yolo_invoke'] = invoke_ms
-
-        t2 = time.perf_counter()
-        output = common.output_tensor(yolo_interpreter, 0).copy()
-        output = (output.astype(np.float32) - yolo_output_zero_point) * yolo_output_scale
-
-        boxes, class_ids, scores = process_yolo_output(output)
+        boxes, class_ids, scores, timings = yolo_detector.infer(frame)
         yolo_results = (boxes, class_ids, scores)
-        stage_times['yolo_post'] = (time.perf_counter() - t2) * 1000
+        stage_times['yolo_pre'] = timings['pre_ms']
+        stage_times['yolo_invoke'] = timings['invoke_ms']
+        stage_times['yolo_post'] = timings['post_ms']
+        inference_times['yolo'] = timings['invoke_ms']
 
 def movenet_inference_thread():
     """Runs MoveNet inference continuously on TPU 1."""
@@ -560,8 +483,7 @@ def video_feed():
     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 def main():
-    global yolo_interpreter, yolo_input_size, yolo_input_scale, yolo_input_zero_point
-    global yolo_output_scale, yolo_output_zero_point, yolo_labels
+    global yolo_interpreter, yolo_detector, yolo_input_size, yolo_labels
     global movenet_interpreter, movenet_input_size, movenet_input_dtype
     global movenet_input_scale, movenet_input_zero_point, cap
     global action_recognizer
@@ -620,15 +542,9 @@ def main():
         return
     print(f"Initializing YOLO interpreter on {yolo_device}...")
     yolo_interpreter.allocate_tensors()
-    yolo_input_size = common.input_size(yolo_interpreter)
-    
-    yolo_input_details = yolo_interpreter.get_input_details()[0]
-    yolo_output_details = yolo_interpreter.get_output_details()[0]
-    
-    yolo_input_scale = yolo_input_details['quantization'][0]
-    yolo_input_zero_point = yolo_input_details['quantization'][1]
-    yolo_output_scale = yolo_output_details['quantization'][0]
-    yolo_output_zero_point = yolo_output_details['quantization'][1]
+    yolo_detector = ObjectDetector(yolo_interpreter, labels=yolo_labels)
+    yolo_input_size = yolo_detector.input_size
+    yolo_labels = yolo_detector.labels
     
     print(f"YOLO model loaded. Input size: {yolo_input_size}")
 
