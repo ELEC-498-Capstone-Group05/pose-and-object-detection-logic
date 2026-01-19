@@ -23,7 +23,12 @@ Note: y=0 is top, y=1 is bottom in the coordinate system.
 """
 
 import numpy as np
+import logging
 from collections import deque
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Keypoint indices for major body parts
 KEYPOINT_NOSE = 0
@@ -228,6 +233,41 @@ class TemporalActionRecognizer:
         self.dynamic_hold_frames = max(3, int(self.fps * 0.3))
         self.frames_since_dynamic = self.dynamic_hold_frames
         
+    def _get_pose_scale(self, keypoints):
+        """
+        Estimate scale of the person based on torso dimensions.
+        Returns a factor where 1.0 is roughly a person filling 1/3 of the screen height.
+        """
+        # Get keypoints
+        left_shoulder = keypoints[KEYPOINT_LEFT_SHOULDER]
+        right_shoulder = keypoints[KEYPOINT_RIGHT_SHOULDER]
+        left_hip = keypoints[KEYPOINT_LEFT_HIP]
+        right_hip = keypoints[KEYPOINT_RIGHT_HIP]
+        
+        # Calculate shoulder center
+        shoulder_y = None
+        if left_shoulder[2] >= CONFIDENCE_THRESHOLD and right_shoulder[2] >= CONFIDENCE_THRESHOLD:
+            shoulder_y = (left_shoulder[0] + right_shoulder[0]) / 2
+        elif left_shoulder[2] >= CONFIDENCE_THRESHOLD:
+            shoulder_y = left_shoulder[0]
+        elif right_shoulder[2] >= CONFIDENCE_THRESHOLD:
+            shoulder_y = right_shoulder[0]
+            
+        # Calculate hip center
+        hip_y = None
+        if left_hip[2] >= CONFIDENCE_THRESHOLD and right_hip[2] >= CONFIDENCE_THRESHOLD:
+            hip_y = (left_hip[0] + right_hip[0]) / 2
+        elif left_hip[2] >= CONFIDENCE_THRESHOLD:
+            hip_y = left_hip[0]
+        elif right_hip[2] >= CONFIDENCE_THRESHOLD:
+            hip_y = right_hip[0]
+
+        if shoulder_y is not None and hip_y is not None:
+            dist = abs(hip_y - shoulder_y)
+            return max(0.1, dist) # Clamp to 0.1 minimum
+            
+        return 0.3 # Default fallback reference scale
+
     def update(self, keypoints, static_pose=None):
         """
         Update the buffer with new keypoints and classify the current action.
@@ -366,7 +406,7 @@ class TemporalActionRecognizer:
         
         return avg_vy, avg_vx, magnitude
     
-    def _feet_are_moving_upward(self):
+    def _feet_are_moving_upward(self, scale_factor=1.0):
         """
         Detect if both ankles are moving upward (jump initiation cue).
         
@@ -379,11 +419,14 @@ class TemporalActionRecognizer:
         left_vy, _, _ = self._get_keypoint_velocity(KEYPOINT_LEFT_ANKLE, num_frames=4)
         right_vy, _, _ = self._get_keypoint_velocity(KEYPOINT_RIGHT_ANKLE, num_frames=4)
 
-        upward_threshold = -0.1  # Negative vy means upward motion
+        # Scale threshold based on person size
+        # Reference scale is 0.3
+        effective_scale = scale_factor / 0.3
+        upward_threshold = -0.1 * effective_scale # Negative vy means upward motion
 
         return left_vy < upward_threshold and right_vy < upward_threshold
     
-    def _detect_arm_strike(self):
+    def _detect_arm_strike(self, scale_factor=1.0):
         """
         Detect rapid arm motion indicative of a forward strike.
         
@@ -397,16 +440,25 @@ class TemporalActionRecognizer:
         # Check total displacement to filter out jitter/noise
         left_disp = self._get_keypoint_displacement(KEYPOINT_LEFT_WRIST, num_frames=3)
         right_disp = self._get_keypoint_displacement(KEYPOINT_RIGHT_WRIST, num_frames=3)
+        
+        # Scale thresholds
+        effective_scale = scale_factor / 0.3
+        
         # Higher threshold to reduce false positives
-        strike_threshold = 1.75
-        displacement_threshold = 0.08
+        strike_threshold = 1.75 * effective_scale
+        displacement_threshold = 0.08 * effective_scale
 
         left_strike = left_wrist_speed > strike_threshold and left_disp > displacement_threshold
         right_strike = right_wrist_speed > strike_threshold and right_disp > displacement_threshold
+        
+        if left_strike or right_strike:
+            logger.info(f"Arm strike detected! Scale: {scale_factor:.2f}, "
+                        f"L_Speed: {left_wrist_speed:.2f}, R_Speed: {right_wrist_speed:.2f}, "
+                        f"Threshold: {strike_threshold:.2f}")
 
         return left_strike or right_strike
     
-    def _detect_leg_kick(self):
+    def _detect_leg_kick(self, scale_factor=1.0):
         """
         Detect rapid leg motion indicative of a kicking action.
         
@@ -420,12 +472,20 @@ class TemporalActionRecognizer:
         left_disp = self._get_keypoint_displacement(KEYPOINT_LEFT_ANKLE, num_frames=5)
         right_disp = self._get_keypoint_displacement(KEYPOINT_RIGHT_ANKLE, num_frames=5)
 
+        # Scale thresholds
+        effective_scale = scale_factor / 0.3
+
         # Higher threshold to reduce false positives
-        kick_threshold = 2.0
-        displacement_threshold = 0.1
+        kick_threshold = 2.0 * effective_scale
+        displacement_threshold = 0.1 * effective_scale
 
         left_kick = left_ankle_speed > kick_threshold and left_disp > displacement_threshold
         right_kick = right_ankle_speed > kick_threshold and right_disp > displacement_threshold
+        
+        if left_kick or right_kick:
+            logger.info(f"Leg kick detected! Scale: {scale_factor:.2f}, "
+                        f"L_Speed: {left_ankle_speed:.2f}, R_Speed: {right_ankle_speed:.2f}, "
+                        f"Threshold: {kick_threshold:.2f}")
 
         return left_kick or right_kick
 
@@ -445,20 +505,26 @@ class TemporalActionRecognizer:
             static_pose = estimate_pose(current_keypoints)
         if static_pose == "Unknown":
             return "Unknown"
+            
+        # Get scale of person
+        current_keypoints = self.keypoint_buffer[-1]
+        scale = self._get_pose_scale(current_keypoints)
+        effective_scale = scale / 0.3
         
         # Calculate body center velocity
         body_vy, body_vx, body_velocity = self._get_body_center_velocity()
         
         # Detect specific actions (order matters - check most distinctive first)
         # 1. JUMPING: Feet are moving upward rapidly and body is ascending
-        if  self._feet_are_moving_upward() and body_vy < -0.1:
+        if  self._feet_are_moving_upward(scale) and body_vy < (-0.1 * effective_scale):
+            logger.info(f"Jumping detected. Vy: {body_vy:.3f}, Scale: {scale:.3f}")
             return "Jumping"
             
         # 2. FIGHTING: Any rapid arm strike motion
         # maintain jumping priority over fighting
         if (static_pose == "Standing" or static_pose == "Unknown"):
-            is_punching = self._detect_arm_strike()
-            is_kicking = self._detect_leg_kick()
+            is_punching = self._detect_arm_strike(scale)
+            is_kicking = self._detect_leg_kick(scale)
             
             # Update attack history
             if is_punching:
@@ -484,13 +550,13 @@ class TemporalActionRecognizer:
     
         # 3. RUNNING / WALKING: moving horizontally
         if static_pose == "Standing":
-            if abs(body_vx) > 0.3:
+            if abs(body_vx) > (0.3 * effective_scale):
                 return "Running"
-            elif abs(body_vx) > 0.1:
+            elif abs(body_vx) > (0.1 * effective_scale):
                 return "Walking"
             
         # 4. IDLE: Minimal motion
-        if body_velocity < 0.25:
+        if body_velocity < (0.25 * effective_scale):
             return "Idle"
         
         # Default: return static pose or unknown

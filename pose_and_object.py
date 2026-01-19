@@ -30,6 +30,7 @@ import cv2
 import numpy as np
 import threading
 import time
+import logging
 from flask import Flask, Response, jsonify
 from pycoral.adapters import common
 from pycoral.utils.dataset import read_label_file
@@ -38,6 +39,10 @@ from pose_estimator import estimate_pose, get_pose_color, TemporalActionRecogniz
 import cropping_algorithm
 
 app = Flask(__name__)
+
+# Suppress Werkzeug request logging
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
 
 # Global variables for YOLO
 yolo_interpreter = None
