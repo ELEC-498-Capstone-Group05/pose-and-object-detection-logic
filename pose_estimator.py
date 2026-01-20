@@ -144,7 +144,7 @@ def estimate_pose(keypoints, min_confidence=CONFIDENCE_THRESHOLD):
     # Torso is more vertical - check for standing vs sitting
     else:
         # Analyze knee position relative to hips
-        if knee_y is not None:
+        if knee_y is not None and hip_to_knee is not None:
             # Standing: knees significantly below hips
             if hip_to_knee > 0.15:
                 return "Standing"
@@ -191,6 +191,7 @@ def get_action_color(action_label):
         "Fighting": (0, 0, 255),       # Red
         "Punching": (0, 128, 255),     # Orange-Red
         "Kicking": (255, 0, 127),      # Deep Pink
+        "Fall Detected": (0, 0, 255),  # Red
         "Idle": (0, 255, 0),           # Green
         "Unknown": (128, 128, 128),    # Gray
     }
@@ -232,6 +233,11 @@ class TemporalActionRecognizer:
         self.current_action = "Unknown"
         self.dynamic_hold_frames = max(3, int(self.fps * 0.3))
         self.frames_since_dynamic = self.dynamic_hold_frames
+
+        # Fall detection state (terminal until reset)
+        self.fall_detected = False
+        self.fall_candidate_frames = 0
+        self.fall_candidate_window = max(10, int(self.fps * 1.0))
         
     def _get_pose_scale(self, keypoints):
         """
@@ -284,6 +290,17 @@ class TemporalActionRecognizer:
         
         # Add to buffer
         self.keypoint_buffer.append(keypoints.copy())
+
+        # Terminal fall state (with reset on getting up)
+        if self.fall_detected:
+            if static_pose is None:
+                static_pose = estimate_pose(keypoints)
+            if static_pose in {"Standing", "Sitting"}:
+                logger.info("Fall reset: person upright again.")
+                self.fall_detected = False
+                self.fall_candidate_frames = 0
+            else:
+                return "Fall Detected"
         
         # Need enough frames for temporal analysis
         if len(self.keypoint_buffer) < self.min_frames:
@@ -405,6 +422,46 @@ class TemporalActionRecognizer:
         magnitude = np.sqrt(avg_vy**2 + avg_vx**2)
         
         return avg_vy, avg_vx, magnitude
+
+    def _detect_fall(self, static_pose, scale, body_vy, body_velocity):
+        """
+        Detect a fall event: rapid downward motion followed by lying down and stillness.
+
+        Args:
+            static_pose: Current static pose label
+            scale: Person scale estimate
+            body_vy: Vertical velocity of body center (positive is downward)
+            body_velocity: Magnitude of body center velocity
+
+        Returns:
+            bool: True if fall is confirmed
+        """
+        effective_scale = scale / 0.3
+
+        # Rapid downward motion threshold
+        drop_threshold = 1.5 * effective_scale
+
+        # Displacement check to filter jitter
+        disp_indices = [KEYPOINT_LEFT_HIP, KEYPOINT_RIGHT_HIP,
+                        KEYPOINT_LEFT_SHOULDER, KEYPOINT_RIGHT_SHOULDER]
+        displacements = [self._get_keypoint_displacement(idx, num_frames=4) for idx in disp_indices]
+        max_disp = max(displacements) if displacements else 0.0
+        disp_threshold = 0.08 * effective_scale
+
+        drop_event = body_vy > drop_threshold and max_disp > disp_threshold
+
+        if drop_event:
+            self.fall_candidate_frames = max(self.fall_candidate_frames, self.fall_candidate_window)
+
+        if self.fall_candidate_frames > 0:
+            self.fall_candidate_frames -= 1
+
+            # Confirm with lying down + stillness
+            stillness_threshold = 0.15 * effective_scale
+            if static_pose == "Lying Down" and body_velocity < stillness_threshold:
+                return True
+
+        return False
     
     def _feet_are_moving_upward(self, scale_factor=1.0):
         """
@@ -505,6 +562,9 @@ class TemporalActionRecognizer:
             static_pose = estimate_pose(current_keypoints)
         if static_pose == "Unknown":
             return "Unknown"
+
+        if self.fall_detected:
+            return "Fall Detected"
             
         # Get scale of person
         current_keypoints = self.keypoint_buffer[-1]
@@ -513,6 +573,12 @@ class TemporalActionRecognizer:
         
         # Calculate body center velocity
         body_vy, body_vx, body_velocity = self._get_body_center_velocity()
+
+        # FALL DETECTION (terminal)
+        if self._detect_fall(static_pose, scale, body_vy, body_velocity):
+            self.fall_detected = True
+            logger.info("Fall detected and confirmed (terminal state).")
+            return "Fall Detected"
         
         # Detect specific actions (order matters - check most distinctive first)
         # 1. JUMPING: Feet are moving upward rapidly and body is ascending
