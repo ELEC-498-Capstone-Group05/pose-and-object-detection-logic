@@ -96,8 +96,8 @@ def yolo_inference_thread():
             frame = latest_frame.copy()
             last_seq = frame_seq
 
-        boxes, class_ids, scores, timings = yolo_detector.infer(frame)
-        yolo_results = (boxes, class_ids, scores)
+        boxes, class_ids, scores, timings, meta = yolo_detector.infer(frame)
+        yolo_results = (boxes, class_ids, scores, meta)
         stage_times['yolo_pre'] = timings['pre_ms']
         stage_times['yolo_invoke'] = timings['invoke_ms']
         stage_times['yolo_post'] = timings['post_ms']
@@ -205,7 +205,11 @@ def gen_frames():
         
         # Draw YOLO detections
         if yolo_results is not None:
-            boxes, class_ids, scores = yolo_results
+            if len(yolo_results) == 4:
+                boxes, class_ids, scores, meta = yolo_results
+            else:
+                boxes, class_ids, scores = yolo_results
+                meta = None
             height, width, _ = frame.shape
             x_scale = width / yolo_input_size[0]
             y_scale = height / yolo_input_size[1]
@@ -221,10 +225,23 @@ def gen_frames():
                 score = scores[i]
                 
                 cx, cy, w, h = box
-                x1 = int((cx - w/2) * x_scale)
-                y1 = int((cy - h/2) * y_scale)
-                x2 = int((cx + w/2) * x_scale)
-                y2 = int((cy + h/2) * y_scale)
+                if meta and meta.get('letterbox'):
+                    scale = meta['scale']
+                    pad_left = meta['pad_left']
+                    pad_top = meta['pad_top']
+                    cx = (cx - pad_left) / scale
+                    cy = (cy - pad_top) / scale
+                    w = w / scale
+                    h = h / scale
+                    x1 = int(cx - w / 2)
+                    y1 = int(cy - h / 2)
+                    x2 = int(cx + w / 2)
+                    y2 = int(cy + h / 2)
+                else:
+                    x1 = int((cx - w/2) * x_scale)
+                    y1 = int((cy - h/2) * y_scale)
+                    x2 = int((cx + w/2) * x_scale)
+                    y2 = int((cy + h/2) * y_scale)
                 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 
@@ -493,7 +510,13 @@ def main():
     parser.add_argument('--movenet_model', required=True, help='Path to MoveNet .tflite model')
     parser.add_argument('--labels', help='Path to COCO labels file')
     parser.add_argument('--camera_idx', type=int, default=0, help='Camera index')
+    parser.add_argument('--yolo_debug', action='store_true', help='Enable YOLO input/output debug dumps')
+    parser.add_argument('--yolo_debug_dir', default='debug_yolo', help='Directory for YOLO debug images')
+    parser.add_argument('--yolo_debug_every', type=int, default=60, help='Dump YOLO debug info every N frames')
     args = parser.parse_args()
+
+    if args.yolo_debug:
+        logging.basicConfig(level=logging.INFO)
 
     # Fail fast with a clearer error if the Edge TPU runtime is missing.
     try:
@@ -542,7 +565,13 @@ def main():
         return
     print(f"Initializing YOLO interpreter on {yolo_device}...")
     yolo_interpreter.allocate_tensors()
-    yolo_detector = ObjectDetector(yolo_interpreter, labels=yolo_labels)
+    yolo_detector = ObjectDetector(
+        yolo_interpreter,
+        labels=yolo_labels,
+        debug=args.yolo_debug,
+        debug_dir=args.yolo_debug_dir,
+        debug_every=args.yolo_debug_every,
+    )
     yolo_input_size = yolo_detector.input_size
     yolo_labels = yolo_detector.labels
     
