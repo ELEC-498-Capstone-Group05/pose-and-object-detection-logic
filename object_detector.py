@@ -13,6 +13,161 @@ import cv2
 from pycoral.adapters import common
 
 
+class TrackedObject:
+    """Represents a single object being tracked over time."""
+    def __init__(self, box, class_id, score, frame_id, min_hits=3):
+        self.box = np.array(box, dtype=np.float32)  # [cx, cy, w, h]
+        self.class_id = class_id
+        self.score = score
+        self.start_frame = frame_id
+        self.last_seen_frame = frame_id
+        self.hits = 1
+        self.min_hits = min_hits
+        self.active = False
+
+    def update(self, box, score, frame_id, alpha=0.6):
+        """Update the object state with a new detection."""
+        self.box = alpha * np.array(box, dtype=np.float32) + (1 - alpha) * self.box
+        self.score = alpha * score + (1 - alpha) * self.score
+        self.last_seen_frame = frame_id
+        self.hits += 1
+        if self.hits >= self.min_hits:
+            self.active = True
+
+
+class ObjectTracker:
+    """
+    Maintains temporal consistency of detections.
+    Uses IoU matching and EMA smoothing.
+    """
+    def __init__(self, iou_threshold=0.1, max_missed_frames=3, min_hits=2, smooth_factor=0.9):
+        self.tracks = []
+        self.iou_threshold = iou_threshold
+        self.max_missed_frames = max_missed_frames
+        self.min_hits = min_hits
+        self.smooth_factor = smooth_factor
+        self.frame_count = 0
+
+    def update(self, boxes, class_ids, scores):
+        """
+        Update tracks with new detections.
+        
+        Args:
+            boxes: numpy array of [cx, cy, w, h]
+            class_ids: numpy array of class indices
+            scores: numpy array of confidence scores
+            
+        Returns:
+            tuple: (tracked_boxes, tracked_class_ids, tracked_scores)
+        """
+        self.frame_count += 1
+        
+        # If no detections, just update missed frames
+        if len(boxes) == 0:
+            self._prune_tracks()
+            return self._get_active_tracks()
+
+        # Match existing tracks to new detections
+        unmatched_tracks = list(range(len(self.tracks)))
+        unmatched_dets = list(range(len(boxes)))
+        
+        # Calculate IoU matrix
+        iou_matrix = np.zeros((len(self.tracks), len(boxes)))
+        for t, track in enumerate(self.tracks):
+             for d, box in enumerate(boxes):
+                 if track.class_id == class_ids[d]:
+                     iou_matrix[t, d] = self._calculate_iou(track.box, box)
+        
+        # Greedy matching
+        if len(self.tracks) > 0 and len(boxes) > 0:
+            while True:
+                if iou_matrix.size == 0 or np.all(iou_matrix == -1):
+                    break
+                    
+                ind = np.unravel_index(np.argmax(iou_matrix, axis=None), iou_matrix.shape)
+                max_iou = iou_matrix[ind]
+                
+                if max_iou < self.iou_threshold:
+                    break
+                    
+                t_idx, d_idx = ind
+                
+                # Update track
+                self.tracks[t_idx].update(
+                    boxes[d_idx], 
+                    scores[d_idx], 
+                    self.frame_count, 
+                    self.smooth_factor
+                )
+                
+                if t_idx in unmatched_tracks:
+                    unmatched_tracks.remove(t_idx)
+                if d_idx in unmatched_dets:
+                    unmatched_dets.remove(d_idx)
+                    
+                # Mark as processed
+                iou_matrix[t_idx, :] = -1
+                iou_matrix[:, d_idx] = -1
+
+        # Create new tracks for unmatched detections
+        for d_idx in unmatched_dets:
+            new_track = TrackedObject(
+                boxes[d_idx], 
+                class_ids[d_idx], 
+                scores[d_idx], 
+                self.frame_count,
+                self.min_hits
+            )
+            self.tracks.append(new_track)
+
+        self._prune_tracks()
+        return self._get_active_tracks()
+
+    def _prune_tracks(self):
+        self.tracks = [
+            t for t in self.tracks 
+            if (self.frame_count - t.last_seen_frame) <= self.max_missed_frames
+        ]
+
+    def _get_active_tracks(self):
+        active = [t for t in self.tracks if t.active]
+        if not active:
+            return np.array([]), np.array([]), np.array([])
+            
+        boxes = np.array([t.box for t in active])
+        class_ids = np.array([t.class_id for t in active])
+        scores = np.array([t.score for t in active])
+        return boxes, class_ids, scores
+
+    def _calculate_iou(self, box1, box2):
+        # box: [cx, cy, w, h]
+        b1_x1 = box1[0] - box1[2] / 2
+        b1_y1 = box1[1] - box1[3] / 2
+        b1_x2 = box1[0] + box1[2] / 2
+        b1_y2 = box1[1] + box1[3] / 2
+        
+        b2_x1 = box2[0] - box2[2] / 2
+        b2_y1 = box2[1] - box2[3] / 2
+        b2_x2 = box2[0] + box2[2] / 2
+        b2_y2 = box2[1] + box2[3] / 2
+        
+        xx1 = max(b1_x1, b2_x1)
+        yy1 = max(b1_y1, b2_y1)
+        xx2 = min(b1_x2, b2_x2)
+        yy2 = min(b1_y2, b2_y2)
+        
+        w = max(0, xx2 - xx1)
+        h = max(0, yy2 - yy1)
+        inter = w * h
+        
+        area1 = box1[2] * box1[3]
+        area2 = box2[2] * box2[3]
+        
+        union = area1 + area2 - inter
+        if union <= 0: return 0
+        return inter / union
+
+
 class ObjectDetector:
     """Encapsulates YOLO object detection logic."""
 

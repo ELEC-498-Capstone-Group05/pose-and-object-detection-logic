@@ -36,7 +36,7 @@ from pycoral.adapters import common
 from pycoral.utils.dataset import read_label_file
 from pycoral.utils.edgetpu import list_edge_tpus, make_interpreter
 from pose_estimator import estimate_pose, get_pose_color, TemporalActionRecognizer, get_action_color
-from object_detector import ObjectDetector
+from object_detector import ObjectDetector, ObjectTracker
 import cropping_algorithm
 
 app = Flask(__name__)
@@ -87,6 +87,7 @@ def yolo_inference_thread():
     """Runs YOLO inference continuously on TPU 0."""
     global latest_frame, yolo_results, inference_times, stage_times, frame_seq, yolo_detector
 
+    tracker = ObjectTracker()
     last_seq = -1
     
     while True:
@@ -97,7 +98,8 @@ def yolo_inference_thread():
             last_seq = frame_seq
 
         boxes, class_ids, scores, timings, meta = yolo_detector.infer(frame)
-        yolo_results = (boxes, class_ids, scores, meta)
+        tracked_boxes, tracked_class_ids, tracked_scores = tracker.update(boxes, class_ids, scores)
+        yolo_results = (tracked_boxes, tracked_class_ids, tracked_scores, meta)
         stage_times['yolo_pre'] = timings['pre_ms']
         stage_times['yolo_invoke'] = timings['invoke_ms']
         stage_times['yolo_post'] = timings['post_ms']
