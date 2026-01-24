@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Child Monitor Alert Test</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.js"></script>
+    <style>
+        body { font-family: sans-serif; padding: 20px; }
+        #log { 
+            background: #f0f0f0; 
+            border: 1px solid #ccc; 
+            padding: 10px; 
+            height: 400px; 
+            overflow-y: scroll; 
+            font-family: monospace; 
+        }
+        .alert { color: red; font-weight: bold; }
+        .success { color: green; }
+        .info { color: blue; }
+    </style>
+</head>
+<body>
+    <h1>Child Monitor Alert Listener</h1>
+    <div id="status">Status: Disconnected</div>
+    <br>
+    <div id="log"></div>
+
+    <script>
+        const statusDiv = document.getElementById('status');
+        const logDiv = document.getElementById('log');
+
+        function appendLog(msg, type='info') {
+            const el = document.createElement('div');
+            el.className = type;
+            el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+            logDiv.prepend(el);
+            console.log(msg);
+        }
+
+        // Connect to the server
+        const socket = io('http://192.168.2.24:5000');
+
+        socket.on('connect', () => {
+            statusDiv.textContent = "Status: Connected";
+            statusDiv.className = "success";
+            appendLog("Connected to Alert System", "success");
+        });
+
+        socket.on('disconnect', () => {
+            statusDiv.textContent = "Status: Disconnected";
+            statusDiv.style.color = "red";
+            appendLog("Disconnected from server", "alert");
+        });
+
+        socket.on('status', (data) => {
+             appendLog(`Server Status: ${data.msg}`, "info");
+        });
+
+        socket.on('alert', (data) => {
+            appendLog(`ALERT RECEIVED: [${data.type}] ${data.message}`, "alert");
+            console.log('Full Alert Data:', data);
+        });
+
+        socket.on('connect_error', (error) => {
+            statusDiv.textContent = "Status: Connection Error";
+            appendLog(`Connection Error: ${error}`, "alert");
+        });
+    </script>
+</body>
+</html>

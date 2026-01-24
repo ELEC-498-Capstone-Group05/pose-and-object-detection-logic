@@ -38,8 +38,10 @@ from pycoral.utils.edgetpu import list_edge_tpus, make_interpreter
 from pose_estimator import estimate_pose, get_pose_color, TemporalActionRecognizer, get_action_color
 from object_detector import ObjectDetector, ObjectTracker
 import cropping_algorithm
+from alert_system import AlertSystem
 
 app = Flask(__name__)
+alert_system = AlertSystem(app)
 
 # Suppress Werkzeug request logging
 log = logging.getLogger('werkzeug')
@@ -205,6 +207,15 @@ def gen_frames():
             frame_seq += 1
             frame_cond.notify_all()
         
+        # Check for alerts
+        if yolo_input_size is not None:
+            alert_system.process_frame(
+                yolo_results, 
+                movenet_results, 
+                movenet_action_label, 
+                yolo_input_size
+            )
+
         # Draw YOLO detections
         if yolo_results is not None:
             if len(yolo_results) == 4:
@@ -642,7 +653,6 @@ def main():
     action_recognizer = TemporalActionRecognizer(window_size=30, fps=fps)
     print(f"Temporal action recognizer initialized (buffer size: 30 frames)")
     
-    # Start inference threads
     print("Starting inference threads...")
     yolo_thread = threading.Thread(target=yolo_inference_thread, daemon=True)
     movenet_thread = threading.Thread(target=movenet_inference_thread, daemon=True)
@@ -650,8 +660,8 @@ def main():
     yolo_thread.start()
     movenet_thread.start()
     
-    print("Starting Flask server at http://0.0.0.0:5000")
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    print("Starting Flask server with SocketIO at http://0.0.0.0:5000")
+    alert_system.socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
 
 if __name__ == '__main__':
     main()

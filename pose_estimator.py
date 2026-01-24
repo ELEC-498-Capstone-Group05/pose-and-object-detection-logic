@@ -479,7 +479,7 @@ class TemporalActionRecognizer:
         # Scale threshold based on person size
         # Reference scale is 0.3
         effective_scale = scale_factor / 0.3
-        upward_threshold = -0.1 * effective_scale # Negative vy means upward motion
+        upward_threshold = -0.2 * effective_scale # Negative vy means upward motion
 
         return left_vy < upward_threshold and right_vy < upward_threshold
     
@@ -582,7 +582,7 @@ class TemporalActionRecognizer:
         
         # Detect specific actions (order matters - check most distinctive first)
         # 1. JUMPING: Feet are moving upward rapidly and body is ascending
-        if  self._feet_are_moving_upward(scale) and body_vy < (-0.1 * effective_scale):
+        if  self._feet_are_moving_upward(scale) and body_vy < (-0.2 * effective_scale):
             logger.info(f"Jumping detected. Vy: {body_vy:.3f}, Scale: {scale:.3f}")
             return "Jumping"
             
@@ -618,7 +618,7 @@ class TemporalActionRecognizer:
         if static_pose == "Standing":
             if abs(body_vx) > (0.3 * effective_scale):
                 return "Running"
-            elif abs(body_vx) > (0.1 * effective_scale):
+            elif abs(body_vx) > (0.15 * effective_scale):
                 return "Walking"
             
         # 4. IDLE: Minimal motion
