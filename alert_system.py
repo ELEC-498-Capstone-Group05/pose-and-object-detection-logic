@@ -49,6 +49,13 @@ class AlertSystem:
                 "message": "Knife detected!",
                 "enabled": True
             },
+            "weapon": {
+                "name": "Weapon Detected",
+                "type": "object",
+                "class_id": 34, # COCO Class ID for Baseball Bat (as a proxy for weapon)
+                "message": "Weapon detected!",
+                "enabled": True
+            },
             "knife_in_hand": {
                 "name": "Knife in Hand",
                 "type": "spatial_proximity",

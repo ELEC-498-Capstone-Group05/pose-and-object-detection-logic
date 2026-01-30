@@ -135,7 +135,7 @@ def estimate_pose(keypoints, min_confidence=CONFIDENCE_THRESHOLD):
         if hip_to_knee is not None:
             if abs(hip_to_knee) < 0.1:
                 return "Lying Down"
-            elif hip_to_knee > 0.15:
+            elif hip_to_knee > 0.1:
                 return "Bending"
             else:
                 return "Lying Down"
@@ -146,7 +146,7 @@ def estimate_pose(keypoints, min_confidence=CONFIDENCE_THRESHOLD):
         # Analyze knee position relative to hips
         if knee_y is not None and hip_to_knee is not None:
             # Standing: knees significantly below hips
-            if hip_to_knee > 0.15:
+            if hip_to_knee > 0.1:
                 return "Standing"
             # Sitting: knees are roughly at same level or above hips
             else:

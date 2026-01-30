@@ -175,7 +175,7 @@ class ObjectDetector:
         self,
         interpreter,
         labels=None,
-        conf_threshold=0.40,
+        conf_threshold=0.30,
         iou_threshold=0.45,
         debug=False,
         debug_dir="debug_yolo",
