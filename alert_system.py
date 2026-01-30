@@ -72,6 +72,27 @@ class AlertSystem:
                 "object_class_id": 57, # COCO Class ID for Couch/Sofa
                 "message": "Jumping on furniture detected!",
                 "enabled": True
+            },
+            "screaming": {
+                "name": "Screaming Detected",
+                "type": "audio",
+                "trigger_classes": [11], # Screaming
+                "message": "Screaming detected!",
+                "enabled": True
+            },
+            "crying": {
+                "name": "Crying Detected",
+                "type": "audio",
+                "trigger_classes": [19, 20], # Crying, sobbing; Baby cry
+                "message": "Crying detected!",
+                "enabled": True
+            },
+            "shatter": {
+                "name": "Shatter Detected",
+                "type": "audio",
+                "trigger_classes": [435, 437, 463, 464], # Glass, Shatter, Smash, Breaking
+                "message": "Shatter/Breaking sound detected!",
+                "enabled": True
             }
         }
         
@@ -188,3 +209,21 @@ class AlertSystem:
                                 if x_min <= kx <= x_max and y_min <= ky <= y_max:
                                     self._trigger(key, config['message'])
                                     break
+
+    def process_audio(self, detections):
+        """
+        Process audio classifier results
+        Args:
+            detections: Dict {class_idx: {'score': float, 'name': str}}
+        """
+        for key, config in self.alerts_config.items():
+            if not config['enabled'] or config['type'] != 'audio':
+                continue
+                
+            for class_id in config['trigger_classes']:
+                if class_id in detections:
+                    # Found a matching class
+                    confidence = detections[class_id]['score']
+                    msg = f"{config['message']} ({int(confidence*100)}%)"
+                    self._trigger(key, msg)
+                    break

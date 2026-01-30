@@ -39,6 +39,7 @@ from pose_estimator import estimate_pose, get_pose_color, TemporalActionRecogniz
 from object_detector import ObjectDetector, ObjectTracker
 import cropping_algorithm
 from alert_system import AlertSystem
+from audio_classifier import AudioClassifier
 
 app = Flask(__name__)
 alert_system = AlertSystem(app)
@@ -73,6 +74,7 @@ movenet_results = None
 movenet_pose_label = "Unknown"
 action_recognizer = None
 movenet_action_label = "Unknown"
+audio_classifier = None
 inference_times = {'yolo': 0.0, 'movenet': 0.0}
 stage_times = {
     'yolo_pre': 0.0,
@@ -371,6 +373,21 @@ def index():
                         <span class="action-value" id="action">Unknown</span>
                     </div>
                 </div>
+
+                <div class="stat-group">
+                    <h3>Audio Monitoring</h3>
+                    <div class="stat-item">
+                        <span class="stat-label">Sound Detected:</span>
+                        <span class="pose-value" id="audio-label">Listening...</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Volume Level:</span>
+                        <span class="stat-value" id="audio-db">-100 dB</span>
+                        <div style="width: 200px; height: 10px; background: #ddd; display: inline-block; margin-left: 10px; vertical-align: middle;">
+                            <div id="db-bar" style="width: 0%; height: 100%; background: #007bff; transition: width 0.1s;"></div>
+                        </div>
+                    </div>
+                </div>
                 
                 <div class="stat-group">
                     <h3>Inference Times</h3>
@@ -448,6 +465,15 @@ def index():
                         actionElem.textContent = data.action;
                         actionElem.style.backgroundColor = rgbToHex(data.action_color);
                         
+                        // Update Audio
+                        document.getElementById('audio-label').textContent = data.audio_label;
+                        document.getElementById('audio-db').textContent = data.audio_db.toFixed(1) + ' dB';
+                        
+                        const db = data.audio_db;
+                        let pct = (db + 60) / 60 * 100; // Map -60..0 dB to 0..100%
+                        pct = Math.max(0, Math.min(100, pct));
+                        document.getElementById('db-bar').style.width = pct + '%';
+
                         // Update inference times
                         document.getElementById('yolo-time').textContent = data.yolo_time.toFixed(2) + ' ms';
                         document.getElementById('movenet-time').textContent = data.movenet_time.toFixed(2) + ' ms';
@@ -495,6 +521,8 @@ def stats():
         'pose_color': get_pose_color(movenet_pose_label),
         'action': movenet_action_label,
         'action_color': get_action_color(movenet_action_label),
+        'audio_label': audio_classifier.latest_top_label if audio_classifier and hasattr(audio_classifier, 'latest_top_label') else "Off",
+        'audio_db': audio_classifier.latest_db if audio_classifier and hasattr(audio_classifier, 'latest_db') else -100.0,
         'yolo_time': inference_times['yolo'],
         'movenet_time': inference_times['movenet'],
         'yolo_pre': stage_times['yolo_pre'],
@@ -516,7 +544,7 @@ def main():
     global yolo_interpreter, yolo_detector, yolo_input_size, yolo_labels
     global movenet_interpreter, movenet_input_size, movenet_input_dtype
     global movenet_input_scale, movenet_input_zero_point, cap
-    global action_recognizer
+    global action_recognizer, audio_classifier
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--yolo_model', required=True, help='Path to YOLO .tflite model')
@@ -526,6 +554,7 @@ def main():
     parser.add_argument('--yolo_debug', action='store_true', help='Enable YOLO input/output debug dumps')
     parser.add_argument('--yolo_debug_dir', default='debug_yolo', help='Directory for YOLO debug images')
     parser.add_argument('--yolo_debug_every', type=int, default=60, help='Dump YOLO debug info every N frames')
+    parser.add_argument('--mic', type=int, default=None, help='Microphone device index')
     args = parser.parse_args()
 
     if args.yolo_debug:
@@ -652,6 +681,19 @@ def main():
     # Initialize temporal action recognizer
     action_recognizer = TemporalActionRecognizer(window_size=30, fps=fps)
     print(f"Temporal action recognizer initialized (buffer size: 30 frames)")
+    
+    # Initialize Audio Classifier
+    audio_classifier = AudioClassifier(
+        model_path='models/audio/yamnet.tflite',
+        labels_path='models/audio/yamnet_class_map.csv',
+        callback=alert_system.process_audio,
+        device_index=args.mic
+    )
+    
+    if audio_classifier.start():
+        print("Audio monitoring started")
+    else:
+        print("WARNING: Audio monitoring failed to start")
     
     print("Starting inference threads...")
     yolo_thread = threading.Thread(target=yolo_inference_thread, daemon=True)
