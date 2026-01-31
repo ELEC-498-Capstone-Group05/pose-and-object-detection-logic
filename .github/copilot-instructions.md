@@ -78,8 +78,7 @@ This is an embedded/edge AI application optimized for Google Coral Edge TPU devi
 - **WebSocket endpoint**: Real-time event notifications (fall detected, hazard identified, etc.)
   - Will need to add `flask-socketio` or similar for bi-directional communication
   - Event schema: `{type: 'alert', action: 'Fall Detected', confidence: 0.95, timestamp: ...}`
-- **WebRTC endpoint**: Live video streaming to mobile app (lower latency than MJPEG)
-  - Consider `aiortc` or `mediasoup` for WebRTC server implementation
+- **MJPEG endpoint**: Live video streaming to mobile app 
   - Mobile app developed separately but will consume these endpoints
 
 ## Development Workflows
@@ -115,7 +114,7 @@ python3 -c "from pycoral.utils.edgetpu import list_edge_tpus; print(list_edge_tp
 4. Add to `dynamic_actions` or `static_actions` set in `_stabilize_action()` for smoothing
 5. For hazard-related actions (e.g., reaching for socket/knife), combine pose data with object detection proximity
 
-### Implementing WebSocket Notifications (Future)
+### WebSocket Notifications 
 ```python
 # Example pattern for Flask-SocketIO integration
 from flask_socketio import SocketIO, emit
@@ -157,10 +156,7 @@ if movenet_action_label == "Fall Detected":
 - **Flask**: Web server for video streaming (multipart MJPEG via `Response(mimetype='multipart/x-mixed-replace')`)
 - **OpenCV (cv2)**: Camera capture, image preprocessing, drawing overlays
 - **numpy**: Array operations for keypoint math
-
-**Planned**:
+- **sounddevice/tflite**: Audio processing for crying detection (CPU-based inference)
 - **Flask-SocketIO**: WebSocket support for mobile app notifications
-- **aiortc/mediasoup**: WebRTC media server for low-latency video streaming
-- **librosa/tflite**: Audio processing for crying detection (CPU-based inference)
 
 No training code exists here - this is inference-only. Models are pre-quantized `.tflite` files. Custom hazard detection model training will be a separate pipeline.

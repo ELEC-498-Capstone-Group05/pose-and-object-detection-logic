@@ -33,6 +33,7 @@ class AlertSystem:
                 "type": "action",
                 "trigger": "Fighting",
                 "message": "Fighting detected!",
+                "severity": "high",
                 "enabled": True
             },
             "fall": {
@@ -40,6 +41,7 @@ class AlertSystem:
                 "type": "action",
                 "trigger": "Fall Detected",
                 "message": "Fall detected!",
+                "severity": "high",
                 "enabled": True
             },
              "knife": {
@@ -47,6 +49,7 @@ class AlertSystem:
                 "type": "object",
                 "class_id": 43, # COCO Class ID for Knife
                 "message": "Knife detected!",
+                "severity": "high",
                 "enabled": True
             },
             "weapon": {
@@ -54,6 +57,7 @@ class AlertSystem:
                 "type": "object",
                 "class_id": 34, # COCO Class ID for Baseball Bat (as a proxy for weapon)
                 "message": "Weapon detected!",
+                "severity": "high",
                 "enabled": True
             },
             "knife_in_hand": {
@@ -63,6 +67,7 @@ class AlertSystem:
                 "keypoints": [KEYPOINT_LEFT_WRIST, KEYPOINT_RIGHT_WRIST],
                 "threshold": 0.1, # Normalized distance threshold
                 "message": "Knife in hand detected!",
+                "severity": "high",
                 "enabled": True
             },
             "jumping_on_couch": {
@@ -71,6 +76,7 @@ class AlertSystem:
                 "action": "Jumping",
                 "object_class_id": 57, # COCO Class ID for Couch/Sofa
                 "message": "Jumping on furniture detected!",
+                "severity": "medium",
                 "enabled": True
             },
             "screaming": {
@@ -78,6 +84,7 @@ class AlertSystem:
                 "type": "audio",
                 "trigger_classes": [11], # Screaming
                 "message": "Screaming detected!",
+                "severity": "medium",
                 "enabled": True
             },
             "crying": {
@@ -85,6 +92,7 @@ class AlertSystem:
                 "type": "audio",
                 "trigger_classes": [19, 20], # Crying, sobbing; Baby cry
                 "message": "Crying detected!",
+                "severity": "medium",
                 "enabled": True
             },
             "shatter": {
@@ -92,6 +100,7 @@ class AlertSystem:
                 "type": "audio",
                 "trigger_classes": [435, 437, 463, 464], # Glass, Shatter, Smash, Breaking
                 "message": "Shatter/Breaking sound detected!",
+                "severity": "medium",
                 "enabled": True
             }
         }

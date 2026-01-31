@@ -194,22 +194,92 @@ def movenet_inference_thread():
         
         stage_times['movenet_post'] = (time.perf_counter() - t2) * 1000
 
-def gen_frames():
-    """Generator for streaming video frames with both YOLO and MoveNet results."""
-    global latest_frame, yolo_results, movenet_results, frame_seq, stage_times
+def annotate_frame(frame, yolo_results, movenet_results, yolo_input_size, yolo_labels):
+    """Draws YOLO and MoveNet results on the frame."""
+    global _NUM_KEYPOINTS
+    
+    # Draw YOLO detections
+    if yolo_results is not None:
+        if len(yolo_results) == 4:
+            boxes, class_ids, scores, meta = yolo_results
+        else:
+            boxes, class_ids, scores = yolo_results
+            meta = None
+        height, width, _ = frame.shape
+        x_scale = width / yolo_input_size[0]
+        y_scale = height / yolo_input_size[1]
+        
+        if len(boxes) > 0:
+            if np.max(boxes) < 2.0:
+                boxes = boxes * np.array([yolo_input_size[0], yolo_input_size[1], 
+                                            yolo_input_size[0], yolo_input_size[1]])
+
+        for i in range(len(boxes)):
+            box = boxes[i]
+            class_id = class_ids[i]
+            score = scores[i]
+            
+            cx, cy, w, h = box
+            if meta and meta.get('letterbox'):
+                scale = meta['scale']
+                pad_left = meta['pad_left']
+                pad_top = meta['pad_top']
+                cx = (cx - pad_left) / scale
+                cy = (cy - pad_top) / scale
+                w = w / scale
+                h = h / scale
+                x1 = int(cx - w / 2)
+                y1 = int(cy - h / 2)
+                x2 = int(cx + w / 2)
+                y2 = int(cy + h / 2)
+            else:
+                x1 = int((cx - w/2) * x_scale)
+                y1 = int((cy - h/2) * y_scale)
+                x2 = int((cx + w/2) * x_scale)
+                y2 = int((cy + h/2) * y_scale)
+            
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+            
+            label_name = yolo_labels.get(class_id, f"Class {class_id}")
+            label = f"{label_name}: {score:.2f}"
+            cv2.putText(frame, label, (x1, y1 - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+    # Draw MoveNet keypoints
+    if movenet_results is not None:
+        pose = movenet_results
+        height, width, _ = frame.shape
+        
+        for i in range(_NUM_KEYPOINTS):
+            y = int(pose[i][0] * height)
+            x = int(pose[i][1] * width)
+            confidence = pose[i][2]
+            
+            if confidence > 0.3:
+                cv2.circle(frame, (x, y), 5, (0, 0, 255), -1)
+
+def camera_loop():
+    """Continuously captures frames from the camera and notifies inference threads."""
+    global latest_frame, frame_seq, yolo_results, movenet_results 
+    global movenet_action_label, yolo_input_size, cap
     
     while True:
-        frame_loop_start = time.perf_counter()
+        if cap is None:
+            time.sleep(1)
+            continue
+            
         ret, frame = cap.read()
         if not ret:
-            break
+            time.sleep(0.1)
+            continue
 
         with frame_cond:
             latest_frame = frame.copy()
             frame_seq += 1
             frame_cond.notify_all()
-        
-        # Check for alerts
+            
+        # Run alert processing on every frame if we have yolo input size set up
+        # This ensures alerts work even if no video client is connected
         if yolo_input_size is not None:
             alert_system.process_frame(
                 yolo_results, 
@@ -218,70 +288,30 @@ def gen_frames():
                 yolo_input_size
             )
 
-        # Draw YOLO detections
-        if yolo_results is not None:
-            if len(yolo_results) == 4:
-                boxes, class_ids, scores, meta = yolo_results
-            else:
-                boxes, class_ids, scores = yolo_results
-                meta = None
-            height, width, _ = frame.shape
-            x_scale = width / yolo_input_size[0]
-            y_scale = height / yolo_input_size[1]
+def gen_frames():
+    """Generator for streaming video frames with both YOLO and MoveNet results."""
+    global latest_frame, yolo_results, movenet_results, frame_seq, stage_times
+    global yolo_input_size, yolo_labels
+    
+    last_seq = -1
+    
+    while True:
+        with frame_cond:
+            while latest_frame is None or frame_seq == last_seq:
+                frame_cond.wait(timeout=0.1)
+            frame = latest_frame.copy()
+            last_seq = frame_seq
             
-            if len(boxes) > 0:
-                if np.max(boxes) < 2.0:
-                    boxes = boxes * np.array([yolo_input_size[0], yolo_input_size[1], 
-                                             yolo_input_size[0], yolo_input_size[1]])
-
-            for i in range(len(boxes)):
-                box = boxes[i]
-                class_id = class_ids[i]
-                score = scores[i]
-                
-                cx, cy, w, h = box
-                if meta and meta.get('letterbox'):
-                    scale = meta['scale']
-                    pad_left = meta['pad_left']
-                    pad_top = meta['pad_top']
-                    cx = (cx - pad_left) / scale
-                    cy = (cy - pad_top) / scale
-                    w = w / scale
-                    h = h / scale
-                    x1 = int(cx - w / 2)
-                    y1 = int(cy - h / 2)
-                    x2 = int(cx + w / 2)
-                    y2 = int(cy + h / 2)
-                else:
-                    x1 = int((cx - w/2) * x_scale)
-                    y1 = int((cy - h/2) * y_scale)
-                    x2 = int((cx + w/2) * x_scale)
-                    y2 = int((cy + h/2) * y_scale)
-                
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
-                label_name = yolo_labels.get(class_id, f"Class {class_id}")
-                label = f"{label_name}: {score:.2f}"
-                cv2.putText(frame, label, (x1, y1 - 10), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        t_start = time.perf_counter()
         
-        # Draw MoveNet keypoints
-        if movenet_results is not None:
-            pose = movenet_results
-            height, width, _ = frame.shape
-            
-            for i in range(_NUM_KEYPOINTS):
-                y = int(pose[i][0] * height)
-                x = int(pose[i][1] * width)
-                confidence = pose[i][2]
-                
-                if confidence > 0.3:
-                    cv2.circle(frame, (x, y), 5, (0, 0, 255), -1)
+        # Draw annotations
+        annotate_frame(frame, yolo_results, movenet_results, yolo_input_size, yolo_labels)
 
         t_enc = time.perf_counter()
         ret, buffer = cv2.imencode('.jpg', frame)
         stage_times['frame_encode'] = (time.perf_counter() - t_enc) * 1000
-        stage_times['frame_total'] = (time.perf_counter() - frame_loop_start) * 1000
+        stage_times['frame_total'] = (time.perf_counter() - t_start) * 1000
+        
         frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
@@ -696,6 +726,12 @@ def main():
         print("WARNING: Audio monitoring failed to start")
     
     print("Starting inference threads...")
+    
+    # Start the camera loop thread
+    camera_thread = threading.Thread(target=camera_loop, daemon=True)
+    camera_thread.start()
+    print("Camera capture thread started")
+
     yolo_thread = threading.Thread(target=yolo_inference_thread, daemon=True)
     movenet_thread = threading.Thread(target=movenet_inference_thread, daemon=True)
     
