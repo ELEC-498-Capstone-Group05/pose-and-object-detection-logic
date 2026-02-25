@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dual TPU Inference</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f0f0f0;
+        }
+        .container {
+            display: flex;
+            gap: 20px;
+            max-width: 1200px;
+        }
+        .video-section {
+            flex: 0 0 auto;
+        }
+        .stats-section {
+            flex: 1;
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+        }
+        .stat-group {
+            margin-bottom: 20px;
+            padding: 15px;
+            background-color: #f9f9f9;
+            border-radius: 5px;
+        }
+        .stat-group h3 {
+            margin-top: 0;
+            color: #555;
+        }
+        .stat-item {
+            margin: 8px 0;
+            font-size: 16px;
+        }
+        .stat-label {
+            font-weight: bold;
+            display: inline-block;
+            width: 180px;
+        }
+        .stat-value {
+            color: #007bff;
+        }
+        .pose-value {
+            font-size: 20px;
+            font-weight: bold;
+            padding: 5px 10px;
+            border-radius: 4px;
+            display: inline-block;
+        }
+        .action-value {
+            font-size: 20px;
+            font-weight: bold;
+            padding: 5px 10px;
+            border-radius: 4px;
+            display: inline-block;
+        }
+    </style>
+</head>
+<body>
+    <h1>Dual Edge TPU Inference</h1>
+    <p>YOLO Object Detection + MoveNet Pose Estimation + Action Recognition</p>
+    <div class="container">
+        <div class="video-section">
+            <img src='/video_feed' width='640' height='480' />
+        </div>
+        <div class="stats-section">
+            <div class="stat-group">
+                <h3>Pose & Action Detection</h3>
+                <div class="stat-item">
+                    <span class="stat-label">Current Pose:</span>
+                    <span class="pose-value" id="pose">Unknown</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Current Action:</span>
+                    <span class="action-value" id="action">Unknown</span>
+                </div>
+            </div>
+
+            <div class="stat-group">
+                <h3>Audio Monitoring</h3>
+                <div class="stat-item">
+                    <span class="stat-label">Sound Detected:</span>
+                    <span class="pose-value" id="audio-label">Listening...</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Volume Level:</span>
+                    <span class="stat-value" id="audio-db">-100 dB</span>
+                    <div style="width: 200px; height: 10px; background: #ddd; display: inline-block; margin-left: 10px; vertical-align: middle;">
+                        <div id="db-bar" style="width: 0%; height: 100%; background: #007bff; transition: width 0.1s;"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="stat-group">
+                <h3>Inference Times</h3>
+                <div class="stat-item">
+                    <span class="stat-label">YOLO Inference:</span>
+                    <span class="stat-value" id="yolo-time">0.00 ms</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">MoveNet Inference:</span>
+                    <span class="stat-value" id="movenet-time">0.00 ms</span>
+                </div>
+            </div>
+            
+            <div class="stat-group">
+                <h3>Detailed Timing (YOLO)</h3>
+                <div class="stat-item">
+                    <span class="stat-label">Preprocessing:</span>
+                    <span class="stat-value" id="yolo-pre">0.0 ms</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">TPU Invocation:</span>
+                    <span class="stat-value" id="yolo-invoke">0.0 ms</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Postprocessing:</span>
+                    <span class="stat-value" id="yolo-post">0.0 ms</span>
+                </div>
+            </div>
+            
+            <div class="stat-group">
+                <h3>Detailed Timing (MoveNet)</h3>
+                <div class="stat-item">
+                    <span class="stat-label">Preprocessing:</span>
+                    <span class="stat-value" id="movenet-pre">0.0 ms</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">TPU Invocation:</span>
+                    <span class="stat-value" id="movenet-invoke">0.0 ms</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Postprocessing:</span>
+                    <span class="stat-value" id="movenet-post">0.0 ms</span>
+                </div>
+            </div>
+            
+            <div class="stat-group">
+                <h3>Frame Processing</h3>
+                <div class="stat-item">
+                    <span class="stat-label">Frame Rate:</span>
+                    <span class="stat-value" id="frame-rate">0.0 FPS</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Frame Encoding:</span>
+                    <span class="stat-value" id="frame-encode">0.0 ms</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Total Frame Time:</span>
+                    <span class="stat-value" id="frame-total">0.0 ms</span>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function updateStats() {
+            fetch('/stats')
+                .then(response => response.json())
+                .then(data => {
+                    // Update pose and action
+                    const poseElem = document.getElementById('pose');
+                    poseElem.textContent = data.pose;
+                    poseElem.style.backgroundColor = rgbToHex(data.pose_color);
+                    
+                    const actionElem = document.getElementById('action');
+                    actionElem.textContent = data.action;
+                    actionElem.style.backgroundColor = rgbToHex(data.action_color);
+                    
+                    // Update Audio
+                    document.getElementById('audio-label').textContent = data.audio_label;
+                    document.getElementById('audio-db').textContent = data.audio_db.toFixed(1) + ' dB';
+                    
+                    const db = data.audio_db;
+                    let pct = (db + 60) / 60 * 100; // Map -60..0 dB to 0..100%
+                    pct = Math.max(0, Math.min(100, pct));
+                    document.getElementById('db-bar').style.width = pct + '%';
+
+                    // Update inference times
+                    document.getElementById('yolo-time').textContent = data.yolo_time.toFixed(2) + ' ms';
+                    document.getElementById('movenet-time').textContent = data.movenet_time.toFixed(2) + ' ms';
+                    
+                    // Update detailed timing
+                    document.getElementById('yolo-pre').textContent = data.yolo_pre.toFixed(1) + ' ms';
+                    document.getElementById('yolo-invoke').textContent = data.yolo_invoke.toFixed(1) + ' ms';
+                    document.getElementById('yolo-post').textContent = data.yolo_post.toFixed(1) + ' ms';
+                    
+                    document.getElementById('movenet-pre').textContent = data.movenet_pre.toFixed(1) + ' ms';
+                    document.getElementById('movenet-invoke').textContent = data.movenet_invoke.toFixed(1) + ' ms';
+                    document.getElementById('movenet-post').textContent = data.movenet_post.toFixed(1) + ' ms';
+                    
+                    document.getElementById('frame-encode').textContent = data.frame_encode.toFixed(1) + ' ms';
+                    document.getElementById('frame-total').textContent = data.frame_total.toFixed(1) + ' ms';
+                    document.getElementById('frame-rate').textContent = data.fps.toFixed(1) + ' FPS';
+                })
+                .catch(error => console.error('Error fetching stats:', error));
+        }
+        
+        function rgbToHex(rgb) {
+            // Convert BGR tuple to hex color
+            const [b, g, r] = rgb;
+            return '#' + [r, g, b].map(x => {
+                const hex = x.toString(16);
+                return hex.length === 1 ? '0' + hex : hex;
+            }).join('');
+        }
+        
+        // Update stats every 100ms
+        setInterval(updateStats, 100);
+        updateStats();
+    </script>
+</body>
+</html>
