@@ -70,6 +70,7 @@ frame_cond = threading.Condition(frame_lock)
 frame_seq = 0
 latest_frame = None
 yolo_results = None
+yolo_person_present = False
 movenet_results = None
 movenet_pose_label = "Unknown"
 action_recognizer = None
@@ -87,9 +88,36 @@ stage_times = {
     'frame_total': 0.0,
 }
 
+
+def _is_person_class_id(class_id):
+    """Returns True if class_id corresponds to a person label."""
+    try:
+        cid = int(class_id)
+    except (TypeError, ValueError):
+        return False
+
+    label = yolo_labels.get(cid)
+    if isinstance(label, str) and label.strip().lower() == 'person':
+        return True
+
+    # COCO fallback for person class.
+    return cid == 0
+
+
+def _has_person_detection(class_ids):
+    """Returns True when YOLO detections include at least one person."""
+    if class_ids is None or len(class_ids) == 0:
+        return False
+
+    for class_id in class_ids:
+        if _is_person_class_id(class_id):
+            return True
+    return False
+
 def yolo_inference_thread():
     """Runs YOLO inference continuously on TPU 0."""
-    global latest_frame, yolo_results, inference_times, stage_times, frame_seq, yolo_detector
+    global latest_frame, yolo_results, yolo_person_present
+    global inference_times, stage_times, frame_seq, yolo_detector
 
     tracker = ObjectTracker()
     last_seq = -1
@@ -103,7 +131,12 @@ def yolo_inference_thread():
 
         boxes, class_ids, scores, timings, meta = yolo_detector.infer(frame)
         tracked_boxes, tracked_class_ids, tracked_scores = tracker.update(boxes, class_ids, scores)
-        yolo_results = (tracked_boxes, tracked_class_ids, tracked_scores, meta)
+        person_present = _has_person_detection(tracked_class_ids)
+
+        with frame_lock:
+            yolo_results = (tracked_boxes, tracked_class_ids, tracked_scores, meta)
+            yolo_person_present = person_present
+
         stage_times['yolo_pre'] = timings['pre_ms']
         stage_times['yolo_invoke'] = timings['invoke_ms']
         stage_times['yolo_post'] = timings['post_ms']
@@ -113,6 +146,7 @@ def movenet_inference_thread():
     """Runs MoveNet inference continuously on TPU 1."""
     global latest_frame, movenet_results, inference_times, stage_times, frame_seq, crop_region
     global movenet_pose_label, movenet_action_label
+    global yolo_person_present
 
     last_seq = -1
     
@@ -122,6 +156,19 @@ def movenet_inference_thread():
                 frame_cond.wait(timeout=0.1)
             frame = latest_frame.copy()
             last_seq = frame_seq
+            person_present = yolo_person_present
+
+        if not person_present:
+            with frame_lock:
+                movenet_results = None
+                movenet_pose_label = "Unknown"
+                movenet_action_label = "Unknown"
+                crop_region = None
+                inference_times['movenet'] = 0.0
+                stage_times['movenet_pre'] = 0.0
+                stage_times['movenet_invoke'] = 0.0
+                stage_times['movenet_post'] = 0.0
+            continue
 
         frame_h, frame_w, _ = frame.shape
 
