@@ -31,7 +31,7 @@ import numpy as np
 import threading
 import time
 import logging
-from flask import Flask, Response, jsonify, render_template
+from flask import Flask, Response, jsonify, render_template, send_file, abort
 from pycoral.adapters import common
 from pycoral.utils.dataset import read_label_file
 from pycoral.utils.edgetpu import list_edge_tpus, make_interpreter
@@ -40,6 +40,7 @@ from object_detector import ObjectDetector, ObjectTracker
 import cropping_algorithm
 from alert_system import AlertSystem
 from audio_classifier import AudioClassifier
+from video_recorder import RollingVideoRecorder
 
 app = Flask(__name__)
 alert_system = AlertSystem(app)
@@ -87,6 +88,7 @@ stage_times = {
     'frame_encode': 0.0,
     'frame_total': 0.0,
 }
+video_recorder = None
 
 
 def _is_person_class_id(class_id):
@@ -308,7 +310,7 @@ def annotate_frame(frame, yolo_results, movenet_results, yolo_input_size, yolo_l
 def camera_loop():
     """Continuously captures frames from the camera and notifies inference threads."""
     global latest_frame, frame_seq, yolo_results, movenet_results 
-    global movenet_action_label, yolo_input_size, cap
+    global movenet_action_label, yolo_input_size, cap, video_recorder
     
     while True:
         if cap is None:
@@ -319,6 +321,9 @@ def camera_loop():
         if not ret:
             time.sleep(0.1)
             continue
+
+        if video_recorder is not None:
+            video_recorder.write(frame)
 
         with frame_cond:
             latest_frame = frame.copy()
@@ -372,6 +377,7 @@ def stats():
     """Return current inference statistics as JSON."""
     from flask import jsonify
     fps = 1000 / stage_times['frame_total'] if stage_times['frame_total'] > 0 else 0
+    recorder_info = video_recorder.get_storage_info() if video_recorder is not None else {'enabled': False}
     return jsonify({
         'pose': movenet_pose_label,
         'pose_color': get_pose_color(movenet_pose_label),
@@ -389,18 +395,42 @@ def stats():
         'movenet_post': stage_times['movenet_post'],
         'frame_encode': stage_times['frame_encode'],
         'frame_total': stage_times['frame_total'],
-        'fps': fps
+        'fps': fps,
+        'recording': recorder_info
     })
 
 @app.route('/video_feed')
 def video_feed():
     return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
+
+@app.route('/clips')
+def list_clips():
+    if video_recorder is None:
+        return jsonify({'clips': [], 'storage': {'enabled': False}})
+
+    return jsonify({
+        'clips': video_recorder.list_clips(),
+        'storage': video_recorder.get_storage_info()
+    })
+
+
+@app.route('/clips/<path:filename>')
+def download_clip(filename):
+    if video_recorder is None:
+        abort(404)
+
+    clip_path = video_recorder.get_clip_path(filename)
+    if clip_path is None:
+        abort(404)
+
+    return send_file(clip_path, as_attachment=True, download_name=filename)
+
 def main():
     global yolo_interpreter, yolo_detector, yolo_input_size, yolo_labels
     global movenet_interpreter, movenet_input_size, movenet_input_dtype
     global movenet_input_scale, movenet_input_zero_point, cap
-    global action_recognizer, audio_classifier
+    global action_recognizer, audio_classifier, video_recorder
     
     parser = argparse.ArgumentParser()
     parser.add_argument('--yolo_model', required=True, help='Path to YOLO .tflite model')
@@ -411,6 +441,9 @@ def main():
     parser.add_argument('--yolo_debug_dir', default='debug_yolo', help='Directory for YOLO debug images')
     parser.add_argument('--yolo_debug_every', type=int, default=60, help='Dump YOLO debug info every N frames')
     parser.add_argument('--mic', type=int, default=None, help='Microphone device index')
+    parser.add_argument('--recordings_dir', default='recordings', help='Directory where video clips are stored')
+    parser.add_argument('--record_clip_seconds', type=int, default=60, help='Length of each recorded clip in seconds')
+    parser.add_argument('--recording_max_gb', type=float, default=80.0, help='Maximum storage budget for recordings (GB)')
     args = parser.parse_args()
 
     if args.yolo_debug:
@@ -533,6 +566,17 @@ def main():
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = int(cap.get(cv2.CAP_PROP_FPS)) or 30  # Default to 30 if not available
     print(f"Camera {successful_camera_idx} opened: {width}x{height} @ {fps} FPS")
+
+    video_recorder = RollingVideoRecorder(
+        output_dir=args.recordings_dir,
+        clip_seconds=args.record_clip_seconds,
+        max_storage_gb=args.recording_max_gb,
+    )
+    video_recorder.start(width=width, height=height, fps=fps)
+    print(
+        f"Video recording enabled: {args.record_clip_seconds}s clips, "
+        f"max {args.recording_max_gb:.1f} GB, dir='{args.recordings_dir}'"
+    )
     
     # Initialize temporal action recognizer
     action_recognizer = TemporalActionRecognizer(window_size=30, fps=fps)
@@ -565,7 +609,13 @@ def main():
     movenet_thread.start()
     
     print("Starting Flask server with SocketIO at http://0.0.0.0:5000")
-    alert_system.socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
+    try:
+        alert_system.socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
+    finally:
+        if video_recorder is not None:
+            video_recorder.close()
+        if cap is not None:
+            cap.release()
 
 if __name__ == '__main__':
     main()

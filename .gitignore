@@ -12,3 +12,4 @@ __pycache__
 *.changes
 /venv/
 .vscode/
+/recordings
