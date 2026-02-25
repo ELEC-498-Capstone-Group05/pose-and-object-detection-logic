@@ -31,7 +31,7 @@ import numpy as np
 import threading
 import time
 import logging
-from flask import Flask, Response, jsonify, render_template, send_file, abort
+from flask import Flask, Response, jsonify, render_template, send_file, abort, request
 from pycoral.adapters import common
 from pycoral.utils.dataset import read_label_file
 from pycoral.utils.edgetpu import list_edge_tpus, make_interpreter
@@ -425,6 +425,34 @@ def download_clip(filename):
         abort(404)
 
     return send_file(clip_path, as_attachment=True, download_name=filename)
+
+
+@app.route('/safezone', methods=['GET'])
+def get_safezone():
+    return jsonify({
+        'ok': True,
+        'safezone': alert_system.get_safezone_config(),
+        'errors': None
+    })
+
+
+@app.route('/safezone', methods=['POST'])
+def set_safezone():
+    payload = request.get_json(silent=True)
+    config, errors = alert_system.update_safezone_config(payload)
+
+    if errors is not None:
+        return jsonify({
+            'ok': False,
+            'safezone': None,
+            'errors': errors
+        }), 400
+
+    return jsonify({
+        'ok': True,
+        'safezone': config,
+        'errors': None
+    })
 
 def main():
     global yolo_interpreter, yolo_detector, yolo_input_size, yolo_labels

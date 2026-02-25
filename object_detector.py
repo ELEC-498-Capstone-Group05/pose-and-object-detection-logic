@@ -365,6 +365,8 @@ class ObjectDetector:
             'pad_left': pad_left,
             'pad_top': pad_top,
             'input_size': self.input_size,
+            'frame_width': frame_bgr.shape[1],
+            'frame_height': frame_bgr.shape[0],
             'letterbox': True,
         }
 
