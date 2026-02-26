@@ -440,7 +440,7 @@ class AlertSystem:
         elif safezone_alert and safezone_alert.get('enabled', False):
             has_person, outside_now, person_centers, person_debug = self._safezone_person_status(norm_boxes, class_ids, scores)
             should_trigger = self._should_trigger_safezone_exit(has_person, outside_now)
-            self._log_safezone_debug(has_person, outside_now, should_trigger, person_centers, person_debug)
+            # self._log_safezone_debug(has_person, outside_now, should_trigger, person_centers, person_debug)
             if should_trigger:
                 self._trigger('safezone_exit', safezone_alert['message'])
 

@@ -60,7 +60,7 @@ This is an embedded/edge AI application optimized for Google Coral Edge TPU devi
 - [pose_estimator.py](pose_estimator.py): Static pose classification (`estimate_pose()`) + temporal action detection (`TemporalActionRecognizer`)
 - [cropping_algorithm.py](cropping_algorithm.py): MoveNet adaptive crop logic (from Google's pose estimation examples)
 - [pycoral_examples/](pycoral_examples/): Reference implementations (not used in production, only for learning)
-- [audio_classifier.py](audio_classifier.py): Planned audio analysis (crying detection) - will run on Pi's CPU alongside TPU inference
+- [audio_classifier.py](audio_classifier.py): Audio analysis (crying, smashing, screaming detection) runs on Pi's CPU alongside TPU inference
 
 ## Future Development Roadmap
 
@@ -68,11 +68,6 @@ This is an embedded/edge AI application optimized for Google Coral Edge TPU devi
 - Replace current YOLO+COCO with custom object detection model
 - Target classes: knives, fire, firearms, electrical outlets, cleaning chemicals, stairs/windows (proximity alerts)
 - Will require training pipeline for custom .tflite model with Edge TPU quantization
-
-### Audio Classification (Planned)
-- Implement [audio_classifier.py](audio_classifier.py) to detect crying, screaming, glass breaking
-- Run on Raspberry Pi CPU in separate thread to avoid TPU contention
-- Consider librosa/tensorflow-lite audio models optimized for ARM
 
 ### Mobile App Integration (External React Native App)
 - **WebSocket endpoint**: Real-time event notifications (fall detected, hazard identified, etc.)

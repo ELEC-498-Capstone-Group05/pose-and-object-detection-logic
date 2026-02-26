@@ -18,7 +18,7 @@ To run this code, you must attach two Edge TPUs to the host and
 install the Edge TPU runtime (`libedgetpu.so`) and `tflite_runtime`.
 
 Example usage:
-python3 pose_and_object.py \
+python3 server.py \
   --yolo_model models/object/yolo11n_edgetpu.tflite \
   --movenet_model models/pose/movenet_single_pose_lightning_ptq_edgetpu.tflite \
   --labels models/object/coco_labels.txt
