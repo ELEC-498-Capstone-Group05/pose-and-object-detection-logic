@@ -146,8 +146,12 @@
             <div class="stat-group">
                 <h3>Frame Processing</h3>
                 <div class="stat-item">
-                    <span class="stat-label">Frame Rate:</span>
+                    <span class="stat-label">Stream FPS:</span>
                     <span class="stat-value" id="frame-rate">0.0 FPS</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Processing FPS:</span>
+                    <span class="stat-value" id="processing-fps">0.0 FPS</span>
                 </div>
                 <div class="stat-item">
                     <span class="stat-label">Frame Encoding:</span>
@@ -158,6 +162,54 @@
                     <span class="stat-value" id="frame-total">0.0 ms</span>
                 </div>
             </div>
+
+            <div class="stat-group">
+                <h3>Pipeline Metrics (Phase 2)</h3>
+                <div class="stat-item">
+                    <span class="stat-label">Schema Version:</span>
+                    <span class="stat-value" id="schema-version">n/a</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Capture->Stream Latency:</span>
+                    <span class="stat-value" id="capture-stream-latency">0.0 ms</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Capture->Stream Latency P95:</span>
+                    <span class="stat-value" id="capture-stream-latency-p95">0.0 ms</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Capture FPS:</span>
+                    <span class="stat-value" id="capture-fps">0.0 FPS</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">YOLO FPS:</span>
+                    <span class="stat-value" id="yolo-fps">0.0 FPS</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">MoveNet FPS:</span>
+                    <span class="stat-value" id="movenet-fps">0.0 FPS</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Queue Lag (YOLO):</span>
+                    <span class="stat-value" id="queue-yolo">0 frames</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Queue Lag (MoveNet):</span>
+                    <span class="stat-value" id="queue-movenet">0 frames</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Result Age (YOLO):</span>
+                    <span class="stat-value" id="result-age-yolo">0 frames</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Result Age (MoveNet):</span>
+                    <span class="stat-value" id="result-age-movenet">0 frames</span>
+                </div>
+                <div class="stat-item">
+                    <span class="stat-label">Dropped Frames:</span>
+                    <span class="stat-value" id="dropped-frames">0</span>
+                </div>
+            </div>
         </div>
     </div>
     
@@ -166,6 +218,10 @@
             fetch('/stats')
                 .then(response => response.json())
                 .then(data => {
+                    const latency = data.latency || {};
+                    const throughput = data.throughput || {};
+                    const queue = data.queue || {};
+
                     // Update pose and action
                     const poseElem = document.getElementById('pose');
                     poseElem.textContent = data.pose;
@@ -200,6 +256,24 @@
                     document.getElementById('frame-encode').textContent = data.frame_encode.toFixed(1) + ' ms';
                     document.getElementById('frame-total').textContent = data.frame_total.toFixed(1) + ' ms';
                     document.getElementById('frame-rate').textContent = data.fps.toFixed(1) + ' FPS';
+                    document.getElementById('processing-fps').textContent = (data.processing_fps || 0).toFixed(1) + ' FPS';
+
+                    // Update Phase 2 metrics
+                    document.getElementById('schema-version').textContent = data.schema_version || 'n/a';
+                    const captureStreamMs = latency.capture_to_stream_ms ?? latency.end_to_end_ms ?? 0;
+                    const captureStreamP95Ms = latency.capture_to_stream_p95_ms ?? latency.end_to_end_p95_ms ?? 0;
+                    document.getElementById('capture-stream-latency').textContent = captureStreamMs.toFixed(1) + ' ms';
+                    document.getElementById('capture-stream-latency-p95').textContent = captureStreamP95Ms.toFixed(1) + ' ms';
+
+                    document.getElementById('capture-fps').textContent = ((throughput.capture_fps || 0).toFixed(1)) + ' FPS';
+                    document.getElementById('yolo-fps').textContent = ((throughput.yolo_fps || 0).toFixed(1)) + ' FPS';
+                    document.getElementById('movenet-fps').textContent = ((throughput.movenet_fps || 0).toFixed(1)) + ' FPS';
+
+                    document.getElementById('queue-yolo').textContent = `${Math.round(queue.yolo_lag_frames || 0)} frames`;
+                    document.getElementById('queue-movenet').textContent = `${Math.round(queue.movenet_lag_frames || 0)} frames`;
+                    document.getElementById('result-age-yolo').textContent = `${Math.round(queue.yolo_result_age_frames || 0)} frames`;
+                    document.getElementById('result-age-movenet').textContent = `${Math.round(queue.movenet_result_age_frames || 0)} frames`;
+                    document.getElementById('dropped-frames').textContent = `${Math.round(throughput.frame_drops_total || 0)}`;
                 })
                 .catch(error => console.error('Error fetching stats:', error));
         }

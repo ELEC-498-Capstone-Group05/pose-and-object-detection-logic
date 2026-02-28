@@ -24,10 +24,8 @@ Note: y=0 is top, y=1 is bottom in the coordinate system.
 
 import numpy as np
 import logging
-from collections import deque
+from collections import Counter, deque
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Keypoint indices for major body parts
@@ -58,7 +56,8 @@ def estimate_pose(keypoints, min_confidence=CONFIDENCE_THRESHOLD):
         min_confidence: minimum confidence threshold for valid keypoints
     
     Returns:
-        str: Estimated pose label - "Standing", "Sitting", "Lying Down", "Bending" or "Unknown"
+        str: Estimated pose label - "Standing", "Sitting", "Lying Down",
+             "Bending", "Upside Down" or "Unknown"
     """
     if keypoints is None or len(keypoints) != 17:
         return "Unknown"
@@ -165,10 +164,11 @@ def get_pose_color(pose_label):
         tuple: BGR color tuple for OpenCV
     """
     color_map = {
-        "Standing": (0, 255, 0),      # Green
+        "Standing": (0, 255, 0),       # Green
         "Sitting": (255, 165, 0),      # Orange
         "Lying Down": (255, 0, 255),   # Magenta
-        "Bending": (0, 128, 255),
+        "Bending": (0, 128, 255),      # Orange-Blue
+        "Upside Down": (255, 255, 0),  # Cyan
         "Unknown": (128, 128, 128),    # Gray
     }
     return color_map.get(pose_label, (255, 255, 255))  # White as default
@@ -396,13 +396,17 @@ class TemporalActionRecognizer:
                 if kp[2] > CONFIDENCE_THRESHOLD:
                     centers.append(kp[:2])
             
-            if centers:
+            # Require a quorum to avoid unstable centers from sparse keypoints.
+            if len(centers) >= 3:
                 return np.mean(centers, axis=0)
             return None
         
         recent_frames = list(self.keypoint_buffer)[-10:]
-        centers = [get_body_center(frame) for frame in recent_frames]
-        centers = [c for c in centers if c is not None]
+        centers = []
+        for frame_idx, frame in enumerate(recent_frames):
+            center = get_body_center(frame)
+            if center is not None:
+                centers.append((frame_idx, center))
         
         if len(centers) < 2:
             return 0.0, 0.0, 0.0
@@ -412,10 +416,20 @@ class TemporalActionRecognizer:
         velocities_x = []
         
         for i in range(1, len(centers)):
-            vy = (centers[i][0] - centers[i-1][0]) / self.dt
-            vx = (centers[i][1] - centers[i-1][1]) / self.dt
+            prev_frame_idx, prev_center = centers[i - 1]
+            curr_frame_idx, curr_center = centers[i]
+            frame_gap = curr_frame_idx - prev_frame_idx
+            if frame_gap <= 0:
+                continue
+
+            elapsed = frame_gap * self.dt
+            vy = (curr_center[0] - prev_center[0]) / elapsed
+            vx = (curr_center[1] - prev_center[1]) / elapsed
             velocities_y.append(vy)
             velocities_x.append(vx)
+
+        if not velocities_y:
+            return 0.0, 0.0, 0.0
         
         avg_vy = np.mean(velocities_y)
         avg_vx = np.mean(velocities_x)
@@ -508,10 +522,14 @@ class TemporalActionRecognizer:
         left_strike = left_wrist_speed > strike_threshold and left_disp > displacement_threshold
         right_strike = right_wrist_speed > strike_threshold and right_disp > displacement_threshold
         
-        if left_strike or right_strike:
-            logger.info(f"Arm strike detected! Scale: {scale_factor:.2f}, "
-                        f"L_Speed: {left_wrist_speed:.2f}, R_Speed: {right_wrist_speed:.2f}, "
-                        f"Threshold: {strike_threshold:.2f}")
+        if (left_strike or right_strike) and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Arm strike detected! Scale: %.2f, L_Speed: %.2f, R_Speed: %.2f, Threshold: %.2f",
+                scale_factor,
+                left_wrist_speed,
+                right_wrist_speed,
+                strike_threshold,
+            )
 
         return left_strike or right_strike
     
@@ -539,10 +557,14 @@ class TemporalActionRecognizer:
         left_kick = left_ankle_speed > kick_threshold and left_disp > displacement_threshold
         right_kick = right_ankle_speed > kick_threshold and right_disp > displacement_threshold
         
-        if left_kick or right_kick:
-            logger.info(f"Leg kick detected! Scale: {scale_factor:.2f}, "
-                        f"L_Speed: {left_ankle_speed:.2f}, R_Speed: {right_ankle_speed:.2f}, "
-                        f"Threshold: {kick_threshold:.2f}")
+        if (left_kick or right_kick) and logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Leg kick detected! Scale: %.2f, L_Speed: %.2f, R_Speed: %.2f, Threshold: %.2f",
+                scale_factor,
+                left_ankle_speed,
+                right_ankle_speed,
+                kick_threshold,
+            )
 
         return left_kick or right_kick
 
@@ -588,7 +610,7 @@ class TemporalActionRecognizer:
             
         # 2. FIGHTING: Any rapid arm strike motion
         # maintain jumping priority over fighting
-        if (static_pose == "Standing" or static_pose == "Unknown"):
+        if static_pose == "Standing":
             is_punching = self._detect_arm_strike(scale)
             is_kicking = self._detect_leg_kick(scale)
             
@@ -632,6 +654,20 @@ class TemporalActionRecognizer:
         """Stabilize the instantaneous action prediction across frames."""
         dynamic_actions = {"Running", "Walking", "Jumping", "Fighting", "Punching", "Kicking"}
         static_actions = {"Standing", "Sitting", "Lying Down", "Idle"}
+        dynamic_priority = {
+            "Fighting": 0,
+            "Punching": 1,
+            "Kicking": 2,
+            "Jumping": 3,
+            "Running": 4,
+            "Walking": 5,
+        }
+        static_priority = {
+            "Lying Down": 0,
+            "Sitting": 1,
+            "Standing": 2,
+            "Idle": 3,
+        }
         
         # Special logic for impulse actions (Fighting, Punching, Kicking): hold them longer
         impulse_actions = {"Fighting", "Punching", "Kicking"}
@@ -653,9 +689,13 @@ class TemporalActionRecognizer:
 
         history_dynamic = [a for a in self.action_history if a in dynamic_actions]
         if history_dynamic:
-            candidate = max(set(history_dynamic), key=history_dynamic.count)
+            dynamic_counts = Counter(history_dynamic)
+            candidate = sorted(
+                dynamic_counts.keys(),
+                key=lambda label: (-dynamic_counts[label], dynamic_priority.get(label, 999), label),
+            )[0]
             min_votes = max(2, int(len(self.action_history) * 0.4))
-            if history_dynamic.count(candidate) >= min_votes:
+            if dynamic_counts[candidate] >= min_votes:
                 self.current_action = candidate
                 self.frames_since_dynamic = 0
                 return candidate
@@ -673,7 +713,11 @@ class TemporalActionRecognizer:
 
         history_static = [a for a in self.action_history if a in static_actions]
         if history_static:
-            candidate = max(set(history_static), key=history_static.count)
+            static_counts = Counter(history_static)
+            candidate = sorted(
+                static_counts.keys(),
+                key=lambda label: (-static_counts[label], static_priority.get(label, 999), label),
+            )[0]
             self.current_action = candidate
             return candidate
 

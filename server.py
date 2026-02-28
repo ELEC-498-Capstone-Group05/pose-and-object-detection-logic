@@ -19,7 +19,7 @@ install the Edge TPU runtime (`libedgetpu.so`) and `tflite_runtime`.
 
 Example usage:
 python3 server.py \
-  --yolo_model models/object/yolo11n_edgetpu.tflite \
+  --yolo_model models/object/yolo26n_full_integer_quant_edgetpu.tflite \
   --movenet_model models/pose/movenet_single_pose_lightning_ptq_edgetpu.tflite \
   --labels models/object/coco_labels.txt
 """
@@ -31,6 +31,7 @@ import numpy as np
 import threading
 import time
 import logging
+from collections import deque
 from flask import Flask, Response, jsonify, render_template, send_file, abort, request
 from pycoral.adapters import common
 from pycoral.utils.dataset import read_label_file
@@ -72,10 +73,12 @@ frame_seq = 0
 latest_frame = None
 yolo_results = None
 yolo_person_present = False
+yolo_result_seq = -1
 movenet_results = None
 movenet_pose_label = "Unknown"
 action_recognizer = None
 movenet_action_label = "Unknown"
+movenet_result_seq = -1
 audio_classifier = None
 inference_times = {'yolo': 0.0, 'movenet': 0.0}
 stage_times = {
@@ -89,6 +92,37 @@ stage_times = {
     'frame_total': 0.0,
 }
 video_recorder = None
+
+process_start_unix_ms = int(time.time() * 1000)
+frame_capture_ts = {}
+MAX_CAPTURE_TS = 600
+
+metrics_lock = threading.Lock()
+metrics = {
+    'capture_fps': 0.0,
+    'yolo_fps': 0.0,
+    'movenet_fps': 0.0,
+    'stream_fps': 0.0,
+    'yolo_lag_frames': 0,
+    'movenet_lag_frames': 0,
+    'yolo_lag_p95': 0.0,
+    'movenet_lag_p95': 0.0,
+    'capture_to_stream_latency_ms': 0.0,
+    'capture_to_stream_latency_p95_ms': 0.0,
+    'yolo_dropped_frames_total': 0,
+    'movenet_dropped_frames_total': 0,
+    'frame_drops_total': 0,
+    'yolo_result_age_frames': 0,
+    'movenet_result_age_frames': 0,
+    'yolo_result_age_p95_frames': 0.0,
+    'movenet_result_age_p95_frames': 0.0,
+}
+
+_yolo_lag_samples = deque(maxlen=300)
+_movenet_lag_samples = deque(maxlen=300)
+_capture_to_stream_latency_samples = deque(maxlen=300)
+_yolo_result_age_samples = deque(maxlen=300)
+_movenet_result_age_samples = deque(maxlen=300)
 
 
 def _is_person_class_id(class_id):
@@ -118,18 +152,29 @@ def _has_person_detection(class_ids):
 
 def yolo_inference_thread():
     """Runs YOLO inference continuously on TPU 0."""
-    global latest_frame, yolo_results, yolo_person_present
+    global latest_frame, yolo_results, yolo_person_present, yolo_result_seq
     global inference_times, stage_times, frame_seq, yolo_detector
 
     tracker = ObjectTracker()
     last_seq = -1
+    fps_count = 0
+    fps_window_start = time.perf_counter()
     
     while True:
         with frame_cond:
             while latest_frame is None or frame_seq == last_seq:
                 frame_cond.wait(timeout=0.1)
+            current_seq = frame_seq
             frame = latest_frame.copy()
-            last_seq = frame_seq
+
+            # Count skipped frames for this consumer thread.
+            if last_seq >= 0 and current_seq > last_seq + 1:
+                dropped = current_seq - last_seq - 1
+                with metrics_lock:
+                    metrics['yolo_dropped_frames_total'] += dropped
+                    metrics['frame_drops_total'] += dropped
+
+            last_seq = current_seq
 
         boxes, class_ids, scores, timings, meta = yolo_detector.infer(frame)
         tracked_boxes, tracked_class_ids, tracked_scores = tracker.update(boxes, class_ids, scores)
@@ -138,6 +183,28 @@ def yolo_inference_thread():
         with frame_lock:
             yolo_results = (tracked_boxes, tracked_class_ids, tracked_scores, meta)
             yolo_person_present = person_present
+            yolo_result_seq = current_seq
+
+        with frame_lock:
+            latest_seq_snapshot = frame_seq
+        yolo_lag = max(0, latest_seq_snapshot - current_seq)
+        _yolo_lag_samples.append(yolo_lag)
+
+        fps_count += 1
+        if fps_count >= 30:
+            now = time.perf_counter()
+            elapsed = now - fps_window_start
+            yolo_fps = (fps_count / elapsed) if elapsed > 0 else 0.0
+            with metrics_lock:
+                metrics['yolo_fps'] = yolo_fps
+                metrics['yolo_lag_frames'] = yolo_lag
+                if _yolo_lag_samples:
+                    metrics['yolo_lag_p95'] = float(np.percentile(np.array(_yolo_lag_samples), 95))
+            fps_count = 0
+            fps_window_start = now
+        else:
+            with metrics_lock:
+                metrics['yolo_lag_frames'] = yolo_lag
 
         stage_times['yolo_pre'] = timings['pre_ms']
         stage_times['yolo_invoke'] = timings['invoke_ms']
@@ -148,16 +215,26 @@ def movenet_inference_thread():
     """Runs MoveNet inference continuously on TPU 1."""
     global latest_frame, movenet_results, inference_times, stage_times, frame_seq, crop_region
     global movenet_pose_label, movenet_action_label
-    global yolo_person_present
+    global yolo_person_present, movenet_result_seq
 
     last_seq = -1
+    fps_count = 0
+    fps_window_start = time.perf_counter()
     
     while True:
         with frame_cond:
             while latest_frame is None or frame_seq == last_seq:
                 frame_cond.wait(timeout=0.1)
+            current_seq = frame_seq
             frame = latest_frame.copy()
-            last_seq = frame_seq
+
+            if last_seq >= 0 and current_seq > last_seq + 1:
+                dropped = current_seq - last_seq - 1
+                with metrics_lock:
+                    metrics['movenet_dropped_frames_total'] += dropped
+                    metrics['frame_drops_total'] += dropped
+
+            last_seq = current_seq
             person_present = yolo_person_present
 
         if not person_present:
@@ -166,6 +243,7 @@ def movenet_inference_thread():
                 movenet_pose_label = "Unknown"
                 movenet_action_label = "Unknown"
                 crop_region = None
+                movenet_result_seq = -1
                 inference_times['movenet'] = 0.0
                 stage_times['movenet_pre'] = 0.0
                 stage_times['movenet_invoke'] = 0.0
@@ -236,12 +314,34 @@ def movenet_inference_thread():
         
         # Update global results for drawing
         movenet_results = pose_global
+        movenet_result_seq = current_seq
         
         # Detect action using temporal features (using global keypoints for consistency)
         if action_recognizer is not None:
              movenet_action_label = action_recognizer.update(pose_global, static_pose=movenet_pose_label)
         
         stage_times['movenet_post'] = (time.perf_counter() - t2) * 1000
+
+        with frame_lock:
+            latest_seq_snapshot = frame_seq
+        movenet_lag = max(0, latest_seq_snapshot - current_seq)
+        _movenet_lag_samples.append(movenet_lag)
+
+        fps_count += 1
+        if fps_count >= 30:
+            now = time.perf_counter()
+            elapsed = now - fps_window_start
+            movenet_fps = (fps_count / elapsed) if elapsed > 0 else 0.0
+            with metrics_lock:
+                metrics['movenet_fps'] = movenet_fps
+                metrics['movenet_lag_frames'] = movenet_lag
+                if _movenet_lag_samples:
+                    metrics['movenet_lag_p95'] = float(np.percentile(np.array(_movenet_lag_samples), 95))
+            fps_count = 0
+            fps_window_start = now
+        else:
+            with metrics_lock:
+                metrics['movenet_lag_frames'] = movenet_lag
 
 def annotate_frame(frame, yolo_results, movenet_results, yolo_input_size, yolo_labels):
     """Draws YOLO and MoveNet results on the frame."""
@@ -311,6 +411,9 @@ def camera_loop():
     """Continuously captures frames from the camera and notifies inference threads."""
     global latest_frame, frame_seq, yolo_results, movenet_results 
     global movenet_action_label, yolo_input_size, cap, video_recorder
+
+    fps_count = 0
+    fps_window_start = time.perf_counter()
     
     while True:
         if cap is None:
@@ -328,7 +431,19 @@ def camera_loop():
         with frame_cond:
             latest_frame = frame.copy()
             frame_seq += 1
+            frame_capture_ts[frame_seq] = time.perf_counter()
+            while len(frame_capture_ts) > MAX_CAPTURE_TS:
+                frame_capture_ts.pop(next(iter(frame_capture_ts)))
             frame_cond.notify_all()
+
+        fps_count += 1
+        if fps_count >= 30:
+            now = time.perf_counter()
+            elapsed = now - fps_window_start
+            with metrics_lock:
+                metrics['capture_fps'] = (fps_count / elapsed) if elapsed > 0 else 0.0
+            fps_count = 0
+            fps_window_start = now
             
         # Run alert processing on every frame if we have yolo input size set up
         # This ensures alerts work even if no video client is connected
@@ -343,16 +458,24 @@ def camera_loop():
 def gen_frames():
     """Generator for streaming video frames with both YOLO and MoveNet results."""
     global latest_frame, yolo_results, movenet_results, frame_seq, stage_times
+    global yolo_result_seq, movenet_result_seq
     global yolo_input_size, yolo_labels
     
     last_seq = -1
+    fps_count = 0
+    fps_window_start = time.perf_counter()
     
     while True:
         with frame_cond:
             while latest_frame is None or frame_seq == last_seq:
                 frame_cond.wait(timeout=0.1)
             frame = latest_frame.copy()
-            last_seq = frame_seq
+            current_seq = frame_seq
+            last_seq = current_seq
+
+        with frame_lock:
+            yolo_seq_snapshot = yolo_result_seq
+            movenet_seq_snapshot = movenet_result_seq
             
         t_start = time.perf_counter()
         
@@ -363,6 +486,39 @@ def gen_frames():
         ret, buffer = cv2.imencode('.jpg', frame)
         stage_times['frame_encode'] = (time.perf_counter() - t_enc) * 1000
         stage_times['frame_total'] = (time.perf_counter() - t_start) * 1000
+
+        with frame_cond:
+            capture_ts = frame_capture_ts.pop(current_seq, None)
+        if capture_ts is not None:
+            capture_to_stream_ms = (time.perf_counter() - capture_ts) * 1000.0
+            _capture_to_stream_latency_samples.append(capture_to_stream_ms)
+            with metrics_lock:
+                metrics['capture_to_stream_latency_ms'] = capture_to_stream_ms
+                if _capture_to_stream_latency_samples:
+                    metrics['capture_to_stream_latency_p95_ms'] = float(
+                        np.percentile(np.array(_capture_to_stream_latency_samples), 95)
+                    )
+
+        yolo_result_age = max(0, current_seq - yolo_seq_snapshot) if yolo_seq_snapshot >= 0 else 0
+        movenet_result_age = max(0, current_seq - movenet_seq_snapshot) if movenet_seq_snapshot >= 0 else 0
+        _yolo_result_age_samples.append(yolo_result_age)
+        _movenet_result_age_samples.append(movenet_result_age)
+        with metrics_lock:
+            metrics['yolo_result_age_frames'] = yolo_result_age
+            metrics['movenet_result_age_frames'] = movenet_result_age
+            if _yolo_result_age_samples:
+                metrics['yolo_result_age_p95_frames'] = float(np.percentile(np.array(_yolo_result_age_samples), 95))
+            if _movenet_result_age_samples:
+                metrics['movenet_result_age_p95_frames'] = float(np.percentile(np.array(_movenet_result_age_samples), 95))
+
+        fps_count += 1
+        if fps_count >= 30:
+            now = time.perf_counter()
+            elapsed = now - fps_window_start
+            with metrics_lock:
+                metrics['stream_fps'] = (fps_count / elapsed) if elapsed > 0 else 0.0
+            fps_count = 0
+            fps_window_start = now
         
         frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
@@ -376,9 +532,16 @@ def index():
 def stats():
     """Return current inference statistics as JSON."""
     from flask import jsonify
-    fps = 1000 / stage_times['frame_total'] if stage_times['frame_total'] > 0 else 0
+    now_unix_ms = int(time.time() * 1000)
+    with metrics_lock:
+        metrics_snapshot = dict(metrics)
+    processing_fps = 1000 / stage_times['frame_total'] if stage_times['frame_total'] > 0 else 0.0
+    fps = metrics_snapshot['stream_fps'] if metrics_snapshot['stream_fps'] > 0 else processing_fps
     recorder_info = video_recorder.get_storage_info() if video_recorder is not None else {'enabled': False}
     return jsonify({
+        'schema_version': '2.1.0',
+        'timestamp_unix_ms': now_unix_ms,
+        'process_start_unix_ms': process_start_unix_ms,
         'pose': movenet_pose_label,
         'pose_color': get_pose_color(movenet_pose_label),
         'action': movenet_action_label,
@@ -396,6 +559,37 @@ def stats():
         'frame_encode': stage_times['frame_encode'],
         'frame_total': stage_times['frame_total'],
         'fps': fps,
+        'processing_fps': processing_fps,
+        'latency': {
+            'frame_total_ms': stage_times['frame_total'],
+            'frame_encode_ms': stage_times['frame_encode'],
+            'capture_to_stream_ms': metrics_snapshot['capture_to_stream_latency_ms'],
+            'capture_to_stream_p95_ms': metrics_snapshot['capture_to_stream_latency_p95_ms'],
+            # Deprecated aliases maintained for backward compatibility.
+            'end_to_end_ms': metrics_snapshot['capture_to_stream_latency_ms'],
+            'end_to_end_p95_ms': metrics_snapshot['capture_to_stream_latency_p95_ms'],
+            'yolo_invoke_ms': inference_times['yolo'],
+            'movenet_invoke_ms': inference_times['movenet'],
+        },
+        'throughput': {
+            'capture_fps': metrics_snapshot['capture_fps'],
+            'yolo_fps': metrics_snapshot['yolo_fps'],
+            'movenet_fps': metrics_snapshot['movenet_fps'],
+            'stream_output_fps': metrics_snapshot['stream_fps'] if metrics_snapshot['stream_fps'] > 0 else fps,
+            'frame_drops_total': metrics_snapshot['frame_drops_total'],
+            'yolo_dropped_frames_total': metrics_snapshot['yolo_dropped_frames_total'],
+            'movenet_dropped_frames_total': metrics_snapshot['movenet_dropped_frames_total'],
+        },
+        'queue': {
+            'yolo_lag_frames': metrics_snapshot['yolo_lag_frames'],
+            'yolo_lag_p95_frames': metrics_snapshot['yolo_lag_p95'],
+            'movenet_lag_frames': metrics_snapshot['movenet_lag_frames'],
+            'movenet_lag_p95_frames': metrics_snapshot['movenet_lag_p95'],
+            'yolo_result_age_frames': metrics_snapshot['yolo_result_age_frames'],
+            'yolo_result_age_p95_frames': metrics_snapshot['yolo_result_age_p95_frames'],
+            'movenet_result_age_frames': metrics_snapshot['movenet_result_age_frames'],
+            'movenet_result_age_p95_frames': metrics_snapshot['movenet_result_age_p95_frames'],
+        },
         'recording': recorder_info
     })
 
