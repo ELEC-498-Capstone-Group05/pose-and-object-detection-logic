@@ -111,8 +111,17 @@ class AudioClassifier:
                     else:
                         self.latest_top_label = "Background"
 
-                    if self.callback and detections:
-                        self.callback(detections)
+                    if self.callback:
+                        callback_ts = time.time()
+                        try:
+                            self.callback(
+                                detections,
+                                audio_db=float(self.latest_db),
+                                timestamp=callback_ts,
+                            )
+                        except TypeError:
+                            # Backward compatibility with callbacks that only accept detections.
+                            self.callback(detections)
                 except Exception as e:
                     logger.error(f"Error in audio inference: {e}")
             

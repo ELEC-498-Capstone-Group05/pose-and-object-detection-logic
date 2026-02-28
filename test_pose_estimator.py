@@ -2,6 +2,7 @@ import time
 import numpy as np
 
 from pose_estimator import (
+    KEYPOINT_NOSE,
     KEYPOINT_LEFT_ANKLE,
     KEYPOINT_LEFT_HIP,
     KEYPOINT_LEFT_WRIST,
@@ -153,3 +154,26 @@ def test_punching_onset_handles_missing_capture_timestamp():
     assert action in {"Punching", "Fighting"}
     assert recognizer.last_onset_action == "Punching"
     assert recognizer.last_onset_latency_ms is None
+
+
+def test_head_impact_action_detected_on_abrupt_downward_motion():
+    recognizer = TemporalActionRecognizer(window_size=30, fps=30)
+
+    # Warm-up with stable standing frames.
+    for seq in range(9):
+        frame = _build_standing_frame(center_y=0.46)
+        frame[KEYPOINT_NOSE] = [0.34, 0.50, 1.0]
+        recognizer.update(frame, static_pose="Standing", frame_seq=seq, capture_ts=None)
+
+    action = "Unknown"
+    # Rapid downward body and nose movement to trigger head-impact heuristic.
+    centers = [0.52, 0.60, 0.68]
+    nose_ys = [0.48, 0.60, 0.73]
+    for seq, (center_y, nose_y) in enumerate(zip(centers, nose_ys), start=9):
+        frame = _build_standing_frame(center_y=center_y)
+        frame[KEYPOINT_NOSE] = [nose_y, 0.50, 1.0]
+        action = recognizer.update(frame, static_pose="Standing", frame_seq=seq, capture_ts=None)
+        if action == "Head Impact Suspected":
+            break
+
+    assert action == "Head Impact Suspected"

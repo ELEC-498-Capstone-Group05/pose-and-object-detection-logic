@@ -111,12 +111,13 @@ When any detected person leaves the configured safezone, server emits on `alert`
 {
   "type": "safezone_exit",
   "message": "Person left safezone!",
-  "timestamp": 1740412345.123
+  "severity": "high",
+  "timestamp": 1740412345123
 }
 ```
 
 Notes:
-- `timestamp` is Unix epoch seconds (`float`)
+- `timestamp` is Unix epoch milliseconds (`number`)
 - Safezone alerts are transition-based (inside → outside), not continuous while staying outside
 - Safezone alerts also reuse server cooldown behavior as an additional rate limit
 - Current behavior is "any detected person" (not per-person identity tracking)

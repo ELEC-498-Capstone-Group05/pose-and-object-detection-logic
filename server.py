@@ -93,6 +93,7 @@ stage_times = {
     'frame_total': 0.0,
 }
 video_recorder = None
+camera_read_failures = 0
 
 process_start_unix_ms = int(time.time() * 1000)
 frame_capture_ts = {}
@@ -418,6 +419,7 @@ def camera_loop():
     """Continuously captures frames from the camera and notifies inference threads."""
     global latest_frame, frame_seq, yolo_results, movenet_results 
     global movenet_action_label, yolo_input_size, cap, video_recorder
+    global yolo_result_seq, movenet_result_seq, camera_read_failures
 
     fps_count = 0
     fps_window_start = time.perf_counter()
@@ -429,8 +431,29 @@ def camera_loop():
             
         ret, frame = cap.read()
         if not ret:
+            camera_read_failures += 1
+
+            if yolo_input_size is not None:
+                current_seq = frame_seq
+                yolo_age = max(0, current_seq - yolo_result_seq) if yolo_result_seq >= 0 else 0
+                movenet_age = max(0, current_seq - movenet_result_seq) if movenet_result_seq >= 0 else 0
+                alert_system.process_frame(
+                    yolo_results,
+                    movenet_results,
+                    movenet_action_label,
+                    yolo_input_size,
+                    frame=None,
+                    monitoring_context={
+                        'camera_read_failures': camera_read_failures,
+                        'yolo_result_age_frames': yolo_age,
+                        'movenet_result_age_frames': movenet_age,
+                    },
+                )
+
             time.sleep(0.1)
             continue
+
+        camera_read_failures = 0
 
         if video_recorder is not None:
             video_recorder.write(frame)
@@ -455,11 +478,19 @@ def camera_loop():
         # Run alert processing on every frame if we have yolo input size set up
         # This ensures alerts work even if no video client is connected
         if yolo_input_size is not None:
+            yolo_age = max(0, frame_seq - yolo_result_seq) if yolo_result_seq >= 0 else 0
+            movenet_age = max(0, frame_seq - movenet_result_seq) if movenet_result_seq >= 0 else 0
             alert_system.process_frame(
                 yolo_results, 
                 movenet_results, 
                 movenet_action_label, 
-                yolo_input_size
+                yolo_input_size,
+                frame=frame,
+                monitoring_context={
+                    'camera_read_failures': camera_read_failures,
+                    'yolo_result_age_frames': yolo_age,
+                    'movenet_result_age_frames': movenet_age,
+                },
             )
 
 def gen_frames():
@@ -546,7 +577,7 @@ def stats():
     fps = metrics_snapshot['stream_fps'] if metrics_snapshot['stream_fps'] > 0 else processing_fps
     recorder_info = video_recorder.get_storage_info() if video_recorder is not None else {'enabled': False}
     return jsonify({
-        'schema_version': '2.1.0',
+        'schema_version': '2.2.0',
         'timestamp_unix_ms': now_unix_ms,
         'process_start_unix_ms': process_start_unix_ms,
         'pose': movenet_pose_label,
@@ -597,6 +628,7 @@ def stats():
             'movenet_result_age_frames': metrics_snapshot['movenet_result_age_frames'],
             'movenet_result_age_p95_frames': metrics_snapshot['movenet_result_age_p95_frames'],
         },
+        'alerts': alert_system.get_alert_status(),
         'recording': recorder_info
     })
 

@@ -190,6 +190,7 @@ def get_action_color(action_label):
         "Running": (0, 165, 255),      # Orange
         "Walking": (147, 20, 255),     # Pink
         "Fighting": (0, 0, 255),       # Red
+        "Head Impact Suspected": (0, 0, 200),  # Dark Red
         "Punching": (0, 128, 255),     # Orange-Red
         "Kicking": (255, 0, 127),      # Deep Pink
         "Fall Detected": (0, 0, 255),  # Red
@@ -528,6 +529,26 @@ class TemporalActionRecognizer:
                 return True
 
         return False
+
+    def _detect_head_impact(self, scale, body_vy):
+        """
+        Detect abrupt downward head motion with body descent.
+
+        Uses scale-aware thresholds and displacement gating to reduce jitter false positives.
+        """
+        effective_scale = scale / 0.3
+        nose_vy, _, _ = self._get_keypoint_velocity(KEYPOINT_NOSE, num_frames=3)
+        nose_disp = self._get_keypoint_displacement(KEYPOINT_NOSE, num_frames=4)
+
+        nose_drop_threshold = 2.2 * effective_scale
+        body_drop_threshold = 1.2 * effective_scale
+        nose_disp_threshold = 0.07 * effective_scale
+
+        return (
+            nose_vy > nose_drop_threshold
+            and body_vy > body_drop_threshold
+            and nose_disp > nose_disp_threshold
+        )
     
     def _feet_are_moving_upward(self, scale_factor=1.0):
         """
@@ -631,6 +652,17 @@ class TemporalActionRecognizer:
         body_vy, body_vx, body_velocity = self._get_body_center_velocity()
 
         # FALL DETECTION (terminal)
+        if self._detect_head_impact(scale, body_vy):
+            is_onset = self._mark_action_onset("Head Impact Suspected")
+            logger.warning(
+                "Head impact suspected. body_vy=%.3f, scale=%.3f, %s",
+                body_vy,
+                scale,
+                self._latency_log_suffix(is_onset),
+            )
+            return "Head Impact Suspected"
+
+        # FALL DETECTION (terminal)
         if self._detect_fall(static_pose, scale, body_vy, body_velocity):
             self.fall_detected = True
             logger.info("Fall detected and confirmed (terminal state).")
@@ -708,15 +740,19 @@ class TemporalActionRecognizer:
 
     def _stabilize_action(self, raw_action):
         """Stabilize the instantaneous action prediction across frames."""
-        dynamic_actions = {"Running", "Walking", "Jumping", "Fighting", "Punching", "Kicking"}
+        dynamic_actions = {
+            "Running", "Walking", "Jumping", "Fighting", "Punching", "Kicking",
+            "Head Impact Suspected"
+        }
         static_actions = {"Standing", "Sitting", "Lying Down", "Upside Down", "Idle"}
         dynamic_priority = {
             "Fighting": 0,
             "Punching": 1,
             "Kicking": 2,
-            "Jumping": 3,
-            "Running": 4,
-            "Walking": 5,
+            "Head Impact Suspected": 3,
+            "Jumping": 4,
+            "Running": 5,
+            "Walking": 6,
         }
         static_priority = {
             "Lying Down": 0,
@@ -727,7 +763,7 @@ class TemporalActionRecognizer:
         }
         
         # Special logic for impulse actions (Fighting, Punching, Kicking): hold them longer
-        impulse_actions = {"Fighting", "Punching", "Kicking"}
+        impulse_actions = {"Fighting", "Punching", "Kicking", "Head Impact Suspected"}
         if raw_action in impulse_actions:
             self.current_action = raw_action
             self.frames_since_dynamic = -15  # Negative value gives it extra "stickiness" (approx 0.5s extra)
