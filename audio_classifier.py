@@ -40,7 +40,6 @@ class AudioClassifier:
         self.audio_buffer = deque(maxlen=self.buffer_len)
         self.buffer_lock = threading.Lock()
         self.running = False
-        self.thread = None
         self.stream = None
         self.interpreter = None
         self.class_names = self._load_class_names()
@@ -187,18 +186,19 @@ class AudioClassifier:
         return None
 
     def start(self):
+        """Initialize and start the audio stream without spawning threads."""
         if self.running:
-            return
-            
+            return True
+
         # Select device
         device_id = self._find_working_device()
         if device_id is None:
             logger.error("No suitable audio input device found")
-            return
+            return False
 
         device_name = sd.query_devices(device_id)['name']
         logger.info(f"Starting audio stream on device [{device_id}] {device_name}")
-        
+
         try:
             self.stream = sd.InputStream(
                 samplerate=self.sample_rate,
@@ -209,14 +209,21 @@ class AudioClassifier:
             )
             self.stream.start()
             self.running = True
-            
-            self.thread = threading.Thread(target=self._inference_loop, daemon=True)
-            self.thread.start()
             return True
         except Exception as e:
             logger.error(f"Failed to start audio stream: {e}")
             self.running = False
+            self.stream = None
             return False
+
+    def run(self):
+        """Thread target used by server.py for explicit thread lifecycle control."""
+        if not self.start():
+            return
+        try:
+            self._inference_loop()
+        finally:
+            self.stop()
 
 
     def stop(self):
@@ -228,5 +235,5 @@ class AudioClassifier:
                 self.stream.close()
             except Exception as e:
                 logger.error(f"Error stopping stream: {e}")
-        if self.thread:
-            self.thread.join(timeout=1.0)
+            finally:
+                self.stream = None

@@ -20,7 +20,7 @@ install the Edge TPU runtime (`libedgetpu.so`) and `tflite_runtime`.
 Example usage:
 python3 server.py \
   --yolo_model models/object/yolo26n_full_integer_quant_edgetpu.tflite \
-  --movenet_model models/pose/movenet_single_pose_lightning_ptq_edgetpu.tflite \
+  --movenet_model models/pose/movenet_single_pose_thunder_ptq_edgetpu.tflite \
   --labels models/object/coco_labels.txt
 """
 
@@ -44,6 +44,7 @@ from audio_classifier import AudioClassifier
 from video_recorder import RollingVideoRecorder
 
 app = Flask(__name__)
+logger = logging.getLogger(__name__)
 alert_system = AlertSystem(app)
 
 # Suppress Werkzeug request logging
@@ -227,6 +228,7 @@ def movenet_inference_thread():
                 frame_cond.wait(timeout=0.1)
             current_seq = frame_seq
             frame = latest_frame.copy()
+            capture_ts = frame_capture_ts.get(current_seq)
 
             if last_seq >= 0 and current_seq > last_seq + 1:
                 dropped = current_seq - last_seq - 1
@@ -318,7 +320,12 @@ def movenet_inference_thread():
         
         # Detect action using temporal features (using global keypoints for consistency)
         if action_recognizer is not None:
-             movenet_action_label = action_recognizer.update(pose_global, static_pose=movenet_pose_label)
+             movenet_action_label = action_recognizer.update(
+                 pose_global,
+                 static_pose=movenet_pose_label,
+                 frame_seq=current_seq,
+                 capture_ts=capture_ts,
+             )
         
         stage_times['movenet_post'] = (time.perf_counter() - t2) * 1000
 
@@ -668,8 +675,12 @@ def main():
     parser.add_argument('--recording_max_gb', type=float, default=80.0, help='Maximum storage budget for recordings (GB)')
     args = parser.parse_args()
 
-    if args.yolo_debug:
-        logging.basicConfig(level=logging.INFO)
+    # Configure logging to always capture INFO and above messages
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    logger.info("Logging configured. Starting Child Monitor...")
 
     # Fail fast with a clearer error if the Edge TPU runtime is missing.
     try:
@@ -812,10 +823,9 @@ def main():
         device_index=args.mic
     )
     
-    if audio_classifier.start():
-        print("Audio monitoring started")
-    else:
-        print("WARNING: Audio monitoring failed to start")
+    audio_thread = threading.Thread(target=audio_classifier.run, daemon=True)
+    audio_thread.start()
+    print("Audio monitoring thread started")
     
     print("Starting inference threads...")
     
@@ -834,6 +844,8 @@ def main():
     try:
         alert_system.socketio.run(app, host='0.0.0.0', port=5000, debug=False, allow_unsafe_werkzeug=True)
     finally:
+        if audio_classifier is not None:
+            audio_classifier.stop()
         if video_recorder is not None:
             video_recorder.close()
         if cap is not None:

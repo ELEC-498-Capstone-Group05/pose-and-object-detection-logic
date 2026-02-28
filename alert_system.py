@@ -148,7 +148,7 @@ class AlertSystem:
             self.socketio.emit('alert', {
                 'type': alert_key,
                 'message': message,
-                'timestamp': now
+                'timestamp': now * 1000  # Convert to milliseconds
             })
             self.last_alert_times[alert_key] = now
             return True

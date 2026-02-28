@@ -7,9 +7,10 @@ Real-time child safety monitoring system designed to detect hazardous or unwante
 **Hardware**: Raspberry Pi 5 with 2× Google Coral Edge TPU accelerators + USB webcam
 
 **Current Implementation** (parallel computer vision inference):
-- **YOLO (TPU 0)**: Object detection via [object_detector.py](object_detector.py) using COCO dataset
-- **MoveNet (TPU 1)**: Human pose estimation + temporal action recognition via [pose_estimator.py](pose_estimator.py)
-- **Flask server**: HTTP video streaming + statistics API at [server.py](server.py)
+- **YOLO (TPU 0)**: Object detection via [object_detector.py](../object_detector.py) using COCO dataset
+- **MoveNet (TPU 1)**: Human pose estimation + temporal action recognition via [pose_estimator.py](../pose_estimator.py)
+- **YAMNet (CPU)**: Audio classification for crying/smashing/screaming detection via [audio_classifier.py](../audio_classifier.py)
+- **Flask server**: HTTP video streaming + statistics API at [server.py](../server.py)
 
 This is an embedded/edge AI application optimized for Google Coral Edge TPU devices, not traditional cloud/GPU inference.
 
@@ -19,10 +20,11 @@ This is an embedded/edge AI application optimized for Google Coral Edge TPU devi
 1. **Camera capture** (`gen_frames()`) reads frames, broadcasts to inference threads via `frame_cond` condition variable
 2. **YOLO thread** (`yolo_inference_thread()`) continuously processes frames for object detection
 3. **MoveNet thread** (`movenet_inference_thread()`) runs pose estimation with adaptive cropping
-4. **Results merged** in `gen_frames()` for visualization and streaming
+4. **Audio thread** (`(audio_classifier.run)`) captures audio chunks for classification
+5. **Results merged** in `gen_frames()` for visualization and streaming
 
 ### Critical Dependency: Adaptive Cropping
-- MoveNet uses **stateful cropping** ([cropping_algorithm.py](cropping_algorithm.py)) to track subjects across frames
+- MoveNet uses **stateful cropping** ([cropping_algorithm.py](../cropping_algorithm.py)) to track subjects across frames
 - Previous frame's keypoints determine next frame's crop region for efficiency
 - Global `crop_region` state initialized via `init_crop_region()`, updated via `determine_crop_region()`
 - Local (cropped) keypoints converted to global coordinates for visualization
@@ -55,12 +57,12 @@ This is an embedded/edge AI application optimized for Google Coral Edge TPU devi
 
 ## Key Files & Responsibilities
 
-- [server.py](server.py): Main entry point, Flask routes (`/`, `/video_feed`, `/stats`), thread orchestration
-- [object_detector.py](object_detector.py): YOLO inference encapsulation with NMS postprocessing (`_non_max_suppression()`)
-- [pose_estimator.py](pose_estimator.py): Static pose classification (`estimate_pose()`) + temporal action detection (`TemporalActionRecognizer`)
-- [cropping_algorithm.py](cropping_algorithm.py): MoveNet adaptive crop logic (from Google's pose estimation examples)
-- [pycoral_examples/](pycoral_examples/): Reference implementations (not used in production, only for learning)
-- [audio_classifier.py](audio_classifier.py): Audio analysis (crying, smashing, screaming detection) runs on Pi's CPU alongside TPU inference
+- [server.py](../server.py): Main entry point, Flask routes (`/`, `/video_feed`, `/stats`), thread orchestration
+- [object_detector.py](../object_detector.py): YOLO inference encapsulation with NMS postprocessing (`_non_max_suppression()`)
+- [pose_estimator.py](../pose_estimator.py): Static pose classification (`estimate_pose()`) + temporal action detection (`TemporalActionRecognizer`)
+- [cropping_algorithm.py](../cropping_algorithm.py): MoveNet adaptive crop logic (from Google's pose estimation examples)
+- [pycoral_examples/](../pycoral_examples/): Reference implementations (not used in production, only for learning)
+- [audio_classifier.py](../audio_classifier.py): Audio analysis (crying, smashing, screaming detection) runs on Pi's CPU alongside TPU inference
 
 ## Future Development Roadmap
 
@@ -130,7 +132,7 @@ if movenet_action_label == "Fall Detected":
 ```
 
 ### Modifying Quantization Handling
-- Update preprocessing in [object_detector.py](object_detector.py#L100) or [server.py](server.py#L140) 
+- Update preprocessing in [object_detector.py](../object_detector.py)#L100 or [server.py](../server.py)#L140 
 - Always copy quantization params: `details.get('quantization', (1.0, 0))` returns `(scale, zero_point)`
 - Test with both quantized and float models by checking `input_dtype`
 

@@ -22,6 +22,7 @@ Each keypoint is [y, x, confidence] where y and x are normalized (0-1).
 Note: y=0 is top, y=1 is bottom in the coordinate system.
 """
 
+import time
 import numpy as np
 import logging
 from collections import Counter, deque
@@ -238,6 +239,50 @@ class TemporalActionRecognizer:
         self.fall_detected = False
         self.fall_candidate_frames = 0
         self.fall_candidate_window = max(10, int(self.fps * 1.0))
+
+        # Per-frame context used for in-pipeline latency approximation.
+        self.current_frame_seq = None
+        self.current_capture_ts = None
+        self.current_latency_ms = None
+
+        # Raw action transition state for onset tracking.
+        self._last_raw_action = "Unknown"
+        self.last_onset_action = None
+        self.last_onset_frame_seq = None
+        self.last_onset_capture_ts = None
+        self.last_onset_latency_ms = None
+
+    def _compute_current_latency_ms(self):
+        """Approximate capture-to-detection latency for the current frame."""
+        if self.current_capture_ts is None:
+            return None
+
+        latency_ms = (time.perf_counter() - self.current_capture_ts) * 1000.0
+        return max(0.0, float(latency_ms))
+
+    def _mark_action_onset(self, action):
+        """Record onset metadata when a tracked raw action first appears."""
+        is_onset = self._last_raw_action != action
+        if is_onset:
+            self.last_onset_action = action
+            self.last_onset_frame_seq = self.current_frame_seq
+            self.last_onset_capture_ts = self.current_capture_ts
+            self.last_onset_latency_ms = self.current_latency_ms
+        return is_onset
+
+    def _latency_log_suffix(self, is_onset):
+        """Build a compact suffix used in action detection logs."""
+        seq_text = self.current_frame_seq if self.current_frame_seq is not None else "n/a"
+        latency_text = (
+            f"{self.current_latency_ms:.1f}" if self.current_latency_ms is not None else "n/a"
+        )
+        onset_latency_text = (
+            f"{self.last_onset_latency_ms:.1f}" if self.last_onset_latency_ms is not None else "n/a"
+        )
+        return (
+            f"seq={seq_text}, approx_latency_ms={latency_text}, "
+            f"onset={is_onset}, onset_latency_ms={onset_latency_text}"
+        )
         
     def _get_pose_scale(self, keypoints):
         """
@@ -274,19 +319,25 @@ class TemporalActionRecognizer:
             
         return 0.3 # Default fallback reference scale
 
-    def update(self, keypoints, static_pose=None):
+    def update(self, keypoints, static_pose=None, frame_seq=None, capture_ts=None):
         """
         Update the buffer with new keypoints and classify the current action.
         
         Args:
             keypoints: numpy array of shape (17, 3) where each row is [y, x, confidence]
             static_pose: Optional pre-calculated static pose label. If None, it will be calculated.
+            frame_seq: Optional frame sequence number for this keypoint sample.
+            capture_ts: Optional frame capture timestamp from time.perf_counter().
         
         Returns:
             str: Detected action label
         """
         if keypoints is None or len(keypoints) != 17:
             return "Unknown"
+
+        self.current_frame_seq = frame_seq
+        self.current_capture_ts = capture_ts
+        self.current_latency_ms = self._compute_current_latency_ms()
         
         # Add to buffer
         self.keypoint_buffer.append(keypoints.copy())
@@ -308,6 +359,7 @@ class TemporalActionRecognizer:
         
         # Classify action based on temporal features
         raw_action = self._classify_action(static_pose)
+        self._last_raw_action = raw_action
         return self._stabilize_action(raw_action)
     
     def _get_keypoint_velocity(self, keypoint_idx, num_frames=5):
@@ -522,15 +574,6 @@ class TemporalActionRecognizer:
         left_strike = left_wrist_speed > strike_threshold and left_disp > displacement_threshold
         right_strike = right_wrist_speed > strike_threshold and right_disp > displacement_threshold
         
-        if (left_strike or right_strike) and logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Arm strike detected! Scale: %.2f, L_Speed: %.2f, R_Speed: %.2f, Threshold: %.2f",
-                scale_factor,
-                left_wrist_speed,
-                right_wrist_speed,
-                strike_threshold,
-            )
-
         return left_strike or right_strike
     
     def _detect_leg_kick(self, scale_factor=1.0):
@@ -557,15 +600,6 @@ class TemporalActionRecognizer:
         left_kick = left_ankle_speed > kick_threshold and left_disp > displacement_threshold
         right_kick = right_ankle_speed > kick_threshold and right_disp > displacement_threshold
         
-        if (left_kick or right_kick) and logger.isEnabledFor(logging.DEBUG):
-            logger.debug(
-                "Leg kick detected! Scale: %.2f, L_Speed: %.2f, R_Speed: %.2f, Threshold: %.2f",
-                scale_factor,
-                left_ankle_speed,
-                right_ankle_speed,
-                kick_threshold,
-            )
-
         return left_kick or right_kick
 
     def _classify_action(self, static_pose=None):
@@ -605,7 +639,13 @@ class TemporalActionRecognizer:
         # Detect specific actions (order matters - check most distinctive first)
         # 1. JUMPING: Feet are moving upward rapidly and body is ascending
         if  self._feet_are_moving_upward(scale) and body_vy < (-0.2 * effective_scale):
-            logger.info(f"Jumping detected. Vy: {body_vy:.3f}, Scale: {scale:.3f}")
+            is_onset = self._mark_action_onset("Jumping")
+            logger.info(
+                "Jumping detected. Vy: %.3f, Scale: %.3f, %s",
+                body_vy,
+                scale,
+                self._latency_log_suffix(is_onset),
+            )
             return "Jumping"
             
         # 2. FIGHTING: Any rapid arm strike motion
@@ -625,6 +665,22 @@ class TemporalActionRecognizer:
             # Check for specific actions or compound fighting
             has_recent_punch = "Punching" in self.attack_history
             has_recent_kick = "Kicking" in self.attack_history
+
+            if is_punching:
+                is_onset = self._mark_action_onset("Punching")
+                logger.info(
+                    "Punching detected! Scale: %.2f, %s",
+                    scale,
+                    self._latency_log_suffix(is_onset),
+                )
+
+            if is_kicking:
+                is_onset = self._mark_action_onset("Kicking")
+                logger.info(
+                    "Kicking detected! Scale: %.2f, %s",
+                    scale,
+                    self._latency_log_suffix(is_onset),
+                )
             
             if is_punching or is_kicking:
                 if has_recent_punch and has_recent_kick:
@@ -653,7 +709,7 @@ class TemporalActionRecognizer:
     def _stabilize_action(self, raw_action):
         """Stabilize the instantaneous action prediction across frames."""
         dynamic_actions = {"Running", "Walking", "Jumping", "Fighting", "Punching", "Kicking"}
-        static_actions = {"Standing", "Sitting", "Lying Down", "Idle"}
+        static_actions = {"Standing", "Sitting", "Lying Down", "Upside Down", "Idle"}
         dynamic_priority = {
             "Fighting": 0,
             "Punching": 1,
@@ -666,7 +722,8 @@ class TemporalActionRecognizer:
             "Lying Down": 0,
             "Sitting": 1,
             "Standing": 2,
-            "Idle": 3,
+            "Upside Down": 3,
+            "Idle": 4,
         }
         
         # Special logic for impulse actions (Fighting, Punching, Kicking): hold them longer
