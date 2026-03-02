@@ -1,15 +1,14 @@
 import time
 import logging
 import numpy as np
-import cv2
 from collections import deque
 from flask_socketio import SocketIO, emit
+from pose_estimator import CONFIDENCE_THRESHOLD
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 # Keypoint indices (MoveNet)
-KEYPOINT_NOSE = 0
 KEYPOINT_LEFT_WRIST = 9
 KEYPOINT_RIGHT_WRIST = 10
 KEYPOINT_LEFT_ANKLE = 15
@@ -52,6 +51,9 @@ class AlertSystem:
                 "name": "Fighting Detected",
                 "type": "action",
                 "trigger": "Fighting",
+                "min_person_count": 2,
+                "person_class_id": 0,
+                "person_min_score": 0.45,
                 "message": "Fighting detected!",
                 "severity": "medium",
                 "enabled": True
@@ -62,7 +64,8 @@ class AlertSystem:
                 "trigger": "Fall Detected",
                 "message": "Fall detected!",
                 "severity": "low",
-                "enabled": True
+                "enabled": True,
+                "recovery_stable_s": 1.0
             },
             "fall_no_recovery": {
                 "name": "Fall + No Recovery",
@@ -116,20 +119,6 @@ class AlertSystem:
                 "message": "Jumping on furniture detected!",
                 "severity": "low",
                 "enabled": True
-            },
-            "climbing_hazard": {
-                "name": "Climbing Hazard",
-                "type": "climbing",
-                "message": "Climbing hazard detected!",
-                "severity": "low",
-                "enabled": True,
-                "window_s": 1.5,
-                "min_upward_delta": 0.12,
-                "min_samples": 6,
-                "require_furniture_overlap": True,
-                "furniture_class_ids": [56, 57, 59],
-                "keypoint_confidence": 0.35,
-                "cooldown_s": 6.0
             },
             "screaming": {
                 "name": "Screaming Detected",
@@ -194,8 +183,7 @@ class AlertSystem:
                 "enabled": True,
                 "stale_frames_threshold": 45,
                 "obstruction_persist_frames": 45,
-                "dark_mean_threshold": 28.0,
-                "blur_var_threshold": 20.0,
+                "no_objects_duration_s": 5.0,
                 "camera_failure_threshold": 8,
                 "cooldown_s": 8.0
             }
@@ -215,13 +203,16 @@ class AlertSystem:
         }
 
         self.temporal_state = {
+            'fall_episode': {
+                'active': False,
+                'alerted': False,
+                'start_ts': None,
+                'recovery_candidate_started_ts': None,
+            },
             'fall_no_recovery': {
                 'active': False,
                 'start_ts': None,
                 'alerted': False,
-            },
-            'climbing': {
-                'nose_history': deque(maxlen=120),
             },
             'audio': {
                 'cough_events': deque(maxlen=32),
@@ -234,8 +225,7 @@ class AlertSystem:
             },
             'monitoring': {
                 'stale_counter': 0,
-                'visual_counter': 0,
-                'last_visual_score': {'mean_luma': None, 'lap_var': None},
+                'no_objects_start_ts': None,
             },
         }
         
@@ -337,20 +327,38 @@ class AlertSystem:
         if action_label in motion_actions:
             activity_state['last_motion_ts'] = now
 
+    def _count_people(self, class_ids, scores, min_score=0.45, person_class_id=0):
+        """Count person detections that meet class and confidence criteria."""
+        if class_ids is None or scores is None:
+            return 0
+
+        count = 0
+        limit = min(len(class_ids), len(scores))
+        for i in range(limit):
+            if int(class_ids[i]) != int(person_class_id):
+                continue
+            if float(scores[i]) >= float(min_score):
+                count += 1
+        return count
+
     def _process_fall_no_recovery(self, action_label):
         cfg = self.alerts_config.get('fall_no_recovery', {})
         if not cfg.get('enabled', False):
             return
 
         now = time.time()
+        episode_state = self.temporal_state['fall_episode']
         state = self.temporal_state['fall_no_recovery']
         duration_s = float(cfg.get('duration_s', 8.0))
 
-        if action_label == 'Fall Detected':
+        if episode_state['active']:
             if not state['active']:
                 state['active'] = True
-                state['start_ts'] = now
+                state['start_ts'] = episode_state.get('start_ts') or now
                 state['alerted'] = False
+
+            if state['start_ts'] is None:
+                state['start_ts'] = episode_state.get('start_ts') or now
 
             elapsed = now - (state['start_ts'] or now)
             if (not state['alerted']) and elapsed >= duration_s:
@@ -364,87 +372,46 @@ class AlertSystem:
             state['start_ts'] = None
             state['alerted'] = False
 
-    def _is_keypoint_in_box(self, kp_x, kp_y, box):
-        x_min = box[0] - box[2] / 2.0
-        x_max = box[0] + box[2] / 2.0
-        y_min = box[1] - box[3] / 2.0
-        y_max = box[1] + box[3] / 2.0
-        return x_min <= kp_x <= x_max and y_min <= kp_y <= y_max
-
-    def _process_climbing_hazard(self, action_label, norm_boxes, class_map, movenet_results):
-        cfg = self.alerts_config.get('climbing_hazard', {})
-        if not cfg.get('enabled', False) or movenet_results is None:
-            return
-
-        nose = movenet_results[KEYPOINT_NOSE]
-        if float(nose[2]) < float(cfg.get('keypoint_confidence', 0.35)):
-            return
-
+    def _update_fall_episode_state(self, action_label):
         now = time.time()
-        history = self.temporal_state['climbing']['nose_history']
-        history.append((now, float(nose[0]), float(nose[1])))
+        state = self.temporal_state['fall_episode']
+        fall_cfg = self.alerts_config.get('fall', {})
+        recovery_stable_s = float(fall_cfg.get('recovery_stable_s', 1.0))
 
-        window_s = float(cfg.get('window_s', 1.5))
-        while history and (now - history[0][0]) > window_s:
-            history.popleft()
-
-        min_samples = int(cfg.get('min_samples', 6))
-        if len(history) < min_samples:
+        if action_label == 'Fall Detected':
+            if not state['active']:
+                state['active'] = True
+                state['alerted'] = False
+                state['start_ts'] = now
+            state['recovery_candidate_started_ts'] = None
             return
 
-        y_start = history[0][1]
-        y_end = history[-1][1]
-        upward_delta = y_start - y_end
-        if upward_delta < float(cfg.get('min_upward_delta', 0.12)):
+        if not state['active']:
             return
 
-        furniture_overlap = False
-        furniture_ids = cfg.get('furniture_class_ids', [56, 57, 59])
-        for furniture_id in furniture_ids:
-            for box_idx in class_map.get(furniture_id, []):
-                if self._is_keypoint_in_box(float(nose[1]), float(nose[0]), norm_boxes[box_idx]):
-                    furniture_overlap = True
-                    break
-            if furniture_overlap:
-                break
+        if action_label in {'Standing', 'Sitting'}:
+            if state['recovery_candidate_started_ts'] is None:
+                state['recovery_candidate_started_ts'] = now
 
-        if cfg.get('require_furniture_overlap', True) and not furniture_overlap:
+            elapsed_recovery_s = now - state['recovery_candidate_started_ts']
+            if elapsed_recovery_s >= recovery_stable_s:
+                state['active'] = False
+                state['alerted'] = False
+                state['start_ts'] = None
+                state['recovery_candidate_started_ts'] = None
             return
 
-        if action_label == 'Jumping':
-            return
+        # Non-upright labels are treated as continuing the same fall episode.
+        state['recovery_candidate_started_ts'] = None
 
-        self._trigger(
-            'climbing_hazard',
-            cfg['message'],
-            metadata={
-                'reason': 'sustained_upward_motion',
-                'upward_delta': round(float(upward_delta), 3),
-                'samples': len(history),
-                'furniture_overlap': bool(furniture_overlap),
-            },
-        )
-
-    def _is_visual_obstruction(self, frame, dark_mean_threshold, blur_var_threshold):
-        if frame is None:
-            return False
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        mean_luma = float(np.mean(gray))
-        lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-        self.temporal_state['monitoring']['last_visual_score'] = {
-            'mean_luma': round(mean_luma, 3),
-            'lap_var': round(lap_var, 3),
-        }
-        return mean_luma <= dark_mean_threshold or lap_var <= blur_var_threshold
-
-    def _process_monitoring_failure(self, frame, monitoring_context):
+    def _process_monitoring_failure(self, class_ids, monitoring_context):
         cfg = self.alerts_config.get('monitoring_failure', {})
         if not cfg.get('enabled', False):
             return
 
         context = monitoring_context if isinstance(monitoring_context, dict) else {}
         state = self.temporal_state['monitoring']
+        now = time.time()
 
         yolo_age = int(context.get('yolo_result_age_frames', 0) or 0)
         movenet_age = int(context.get('movenet_result_age_frames', 0) or 0)
@@ -454,18 +421,21 @@ class AlertSystem:
         stale_now = yolo_age >= stale_threshold or movenet_age >= stale_threshold
         state['stale_counter'] = state['stale_counter'] + 1 if stale_now else 0
 
-        visual_now = self._is_visual_obstruction(
-            frame,
-            dark_mean_threshold=float(cfg.get('dark_mean_threshold', 28.0)),
-            blur_var_threshold=float(cfg.get('blur_var_threshold', 20.0)),
-        )
-        state['visual_counter'] = state['visual_counter'] + 1 if visual_now else 0
+        no_objects_duration_s = float(cfg.get('no_objects_duration_s', 5.0))
+        no_objects_now = len(class_ids) == 0
+        if no_objects_now:
+            if state['no_objects_start_ts'] is None:
+                state['no_objects_start_ts'] = now
+            no_objects_elapsed_s = now - state['no_objects_start_ts']
+        else:
+            state['no_objects_start_ts'] = None
+            no_objects_elapsed_s = 0.0
 
         reasons = []
         if state['stale_counter'] >= int(cfg.get('obstruction_persist_frames', 45)):
             reasons.append('stale_inference')
-        if state['visual_counter'] >= int(cfg.get('obstruction_persist_frames', 45)):
-            reasons.append('visual_obstruction')
+        if no_objects_elapsed_s >= no_objects_duration_s:
+            reasons.append('no_objects_detected')
         if camera_read_failures >= int(cfg.get('camera_failure_threshold', 8)):
             reasons.append('camera_read_failures')
 
@@ -480,7 +450,8 @@ class AlertSystem:
                 'yolo_result_age_frames': yolo_age,
                 'movenet_result_age_frames': movenet_age,
                 'camera_read_failures': camera_read_failures,
-                'visual': state['last_visual_score'],
+                'objects_detected_count': len(class_ids),
+                'no_objects_elapsed_s': round(float(no_objects_elapsed_s), 2),
             },
         )
 
@@ -773,6 +744,8 @@ class AlertSystem:
             boxes, class_ids, scores, meta = yolo_results
 
         norm_boxes = self._normalize_boxes_to_frame(boxes, input_size, meta)
+        self._update_fall_episode_state(action_label)
+        fall_episode_state = self.temporal_state['fall_episode']
 
         # 1. Check Action Alerts
         for key, config in self.alerts_config.items():
@@ -780,6 +753,33 @@ class AlertSystem:
             
             if config['type'] == 'action':
                 if action_label == config['trigger']:
+                    if key == 'fall':
+                        if not fall_episode_state['active']:
+                            continue
+                        if fall_episode_state['alerted']:
+                            continue
+                        triggered = self._trigger(
+                            key,
+                            config['message'],
+                            cooldown_override=0.0,
+                            metadata={'reason': 'fall_episode_start'}
+                        )
+                        if triggered:
+                            fall_episode_state['alerted'] = True
+                        continue
+
+                    if key == 'fighting':
+                        min_people = int(config.get('min_person_count', 2))
+                        person_class_id = int(config.get('person_class_id', 0))
+                        person_min_score = float(config.get('person_min_score', 0.45))
+                        people_count = self._count_people(
+                            class_ids,
+                            scores,
+                            min_score=person_min_score,
+                            person_class_id=person_class_id,
+                        )
+                        if people_count < min_people:
+                            continue
                     self._trigger(key, config['message'])
 
         has_person = False
@@ -820,7 +820,7 @@ class AlertSystem:
                         # Check against specified keypoints
                         for kp_idx in config['keypoints']:
                             kp = movenet_results[kp_idx] # [y, x, conf]
-                            if kp[2] < 0.3: continue # Low confidence
+                            if kp[2] < CONFIDENCE_THRESHOLD: continue # Low confidence
                             
                             kp_pos = np.array([kp[1], kp[0]]) # Swap to [x, y]
                             dist = np.linalg.norm(obj_center - kp_pos)
@@ -846,14 +846,12 @@ class AlertSystem:
                             # Ankle keypoints: 15 (Left), 16 (Right)
                             for kp_idx in [KEYPOINT_LEFT_ANKLE, KEYPOINT_RIGHT_ANKLE]:
                                 kp = movenet_results[kp_idx] # [y, x, conf]
-                                if kp[2] < 0.3: continue
+                                if kp[2] < CONFIDENCE_THRESHOLD: continue
                                 
                                 kx, ky = kp[1], kp[0]
-                                if x_min <= kx <= x_max and y_min <= ky <= y_max:
+                                if x_min < kx < x_max and y_min < ky < y_max:
                                     self._trigger(key, config['message'])
                                     break
-
-        self._process_climbing_hazard(action_label, norm_boxes, class_map, movenet_results)
 
         safezone_alert = self.alerts_config.get('safezone_exit')
         safezone_enabled = self.safezone_config.get('enabled', False)
@@ -866,7 +864,7 @@ class AlertSystem:
             if should_trigger:
                 self._trigger('safezone_exit', safezone_alert['message'])
 
-        self._process_monitoring_failure(frame, monitoring_context)
+        self._process_monitoring_failure(class_ids, monitoring_context)
 
     def process_audio(self, detections, audio_db=None, timestamp=None):
         """

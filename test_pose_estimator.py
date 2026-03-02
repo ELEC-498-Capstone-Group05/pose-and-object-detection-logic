@@ -156,6 +156,37 @@ def test_punching_onset_handles_missing_capture_timestamp():
     assert recognizer.last_onset_latency_ms is None
 
 
+def test_small_scale_weak_upward_motion_is_not_jumping():
+    recognizer = TemporalActionRecognizer(window_size=30, fps=30)
+
+    # Build a tiny-scale standing torso: shoulder-hip distance ~= 0.10.
+    for seq in range(9):
+        frame = _base_keypoints()
+        frame[KEYPOINT_LEFT_SHOULDER] = [0.45, 0.45, 1.0]
+        frame[KEYPOINT_RIGHT_SHOULDER] = [0.45, 0.55, 1.0]
+        frame[KEYPOINT_LEFT_HIP] = [0.55, 0.45, 1.0]
+        frame[KEYPOINT_RIGHT_HIP] = [0.55, 0.55, 1.0]
+        frame[KEYPOINT_LEFT_ANKLE] = [0.78, 0.45, 1.0]
+        frame[KEYPOINT_RIGHT_ANKLE] = [0.78, 0.55, 1.0]
+        recognizer.update(frame, static_pose="Standing", frame_seq=seq, capture_ts=None)
+
+    action = "Unknown"
+    # Weak upward trend roughly around the false-positive range from logs.
+    centers = [0.548, 0.546, 0.545]
+    ankles = [0.777, 0.774, 0.772]
+    for seq, (center_y, ankle_y) in enumerate(zip(centers, ankles), start=9):
+        frame = _base_keypoints()
+        frame[KEYPOINT_LEFT_SHOULDER] = [center_y - 0.05, 0.45, 1.0]
+        frame[KEYPOINT_RIGHT_SHOULDER] = [center_y - 0.05, 0.55, 1.0]
+        frame[KEYPOINT_LEFT_HIP] = [center_y + 0.05, 0.45, 1.0]
+        frame[KEYPOINT_RIGHT_HIP] = [center_y + 0.05, 0.55, 1.0]
+        frame[KEYPOINT_LEFT_ANKLE] = [ankle_y, 0.45, 1.0]
+        frame[KEYPOINT_RIGHT_ANKLE] = [ankle_y, 0.55, 1.0]
+        action = recognizer.update(frame, static_pose="Standing", frame_seq=seq, capture_ts=None)
+
+    assert action != "Jumping"
+
+
 def test_head_impact_action_detected_on_abrupt_downward_motion():
     recognizer = TemporalActionRecognizer(window_size=30, fps=30)
 

@@ -44,8 +44,9 @@ KEYPOINT_RIGHT_KNEE = 14
 KEYPOINT_LEFT_ANKLE = 15
 KEYPOINT_RIGHT_ANKLE = 16
 
-# Confidence threshold for considering a keypoint valid
-CONFIDENCE_THRESHOLD = 0.3
+# Confidence threshold for considering a keypoint valid.
+# Keep this permissive enough for fast motion/fall frames where keypoint scores dip.
+CONFIDENCE_THRESHOLD = 0.4
 
 
 def estimate_pose(keypoints, min_confidence=CONFIDENCE_THRESHOLD):
@@ -537,12 +538,12 @@ class TemporalActionRecognizer:
         Uses scale-aware thresholds and displacement gating to reduce jitter false positives.
         """
         effective_scale = scale / 0.3
-        nose_vy, _, _ = self._get_keypoint_velocity(KEYPOINT_NOSE, num_frames=3)
-        nose_disp = self._get_keypoint_displacement(KEYPOINT_NOSE, num_frames=4)
+        nose_vy, _, _ = self._get_keypoint_velocity(KEYPOINT_NOSE)
+        nose_disp = self._get_keypoint_displacement(KEYPOINT_NOSE)
 
-        nose_drop_threshold = 2.2 * effective_scale
-        body_drop_threshold = 1.2 * effective_scale
-        nose_disp_threshold = 0.07 * effective_scale
+        nose_drop_threshold = 2.3 * effective_scale
+        body_drop_threshold = 1.3 * effective_scale
+        nose_disp_threshold = 0.08 * effective_scale
 
         return (
             nose_vy > nose_drop_threshold
@@ -563,19 +564,20 @@ class TemporalActionRecognizer:
         left_vy, _, _ = self._get_keypoint_velocity(KEYPOINT_LEFT_ANKLE, num_frames=4)
         right_vy, _, _ = self._get_keypoint_velocity(KEYPOINT_RIGHT_ANKLE, num_frames=4)
 
-        # Scale threshold based on person size
-        # Reference scale is 0.3
+        # Scale threshold based on person size with an absolute floor.
+        # Without this floor, very small subjects can trigger jump on minor jitter.
         effective_scale = scale_factor / 0.3
-        upward_threshold = -0.2 * effective_scale # Negative vy means upward motion
+        upward_threshold = min(-0.2 * effective_scale, -0.14)  # Negative vy means upward motion
 
         return left_vy < upward_threshold and right_vy < upward_threshold
     
-    def _detect_arm_strike(self, scale_factor=1.0):
+    def _detect_arm_strike(self, scale_factor=1.0, return_debug=False):
         """
         Detect rapid arm motion indicative of a forward strike.
         
         Returns:
             bool: True if either arm is moving rapidly enough to indicate a strike.
+            tuple: (bool, debug_dict) when return_debug is True.
         """
         # Reduced frames to 3 to catch the peak of the punch
         _, _, left_wrist_speed = self._get_keypoint_velocity(KEYPOINT_LEFT_WRIST, num_frames=3)
@@ -594,15 +596,30 @@ class TemporalActionRecognizer:
 
         left_strike = left_wrist_speed > strike_threshold and left_disp > displacement_threshold
         right_strike = right_wrist_speed > strike_threshold and right_disp > displacement_threshold
-        
-        return left_strike or right_strike
+
+        detected = left_strike or right_strike
+        if return_debug:
+            debug = {
+                "left_speed": float(left_wrist_speed),
+                "right_speed": float(right_wrist_speed),
+                "left_disp": float(left_disp),
+                "right_disp": float(right_disp),
+                "speed_threshold": float(strike_threshold),
+                "disp_threshold": float(displacement_threshold),
+                "left_trigger": bool(left_strike),
+                "right_trigger": bool(right_strike),
+            }
+            return detected, debug
+
+        return detected
     
-    def _detect_leg_kick(self, scale_factor=1.0):
+    def _detect_leg_kick(self, scale_factor=1.0, return_debug=False):
         """
         Detect rapid leg motion indicative of a kicking action.
         
         Returns:
             bool: True if either leg is moving rapidly enough to indicate a kick.
+            tuple: (bool, debug_dict) when return_debug is True.
         """
         _, _, left_ankle_speed = self._get_keypoint_velocity(KEYPOINT_LEFT_ANKLE, num_frames=3)
         _, _, right_ankle_speed = self._get_keypoint_velocity(KEYPOINT_RIGHT_ANKLE, num_frames=3)
@@ -620,8 +637,22 @@ class TemporalActionRecognizer:
 
         left_kick = left_ankle_speed > kick_threshold and left_disp > displacement_threshold
         right_kick = right_ankle_speed > kick_threshold and right_disp > displacement_threshold
-        
-        return left_kick or right_kick
+
+        detected = left_kick or right_kick
+        if return_debug:
+            debug = {
+                "left_speed": float(left_ankle_speed),
+                "right_speed": float(right_ankle_speed),
+                "left_disp": float(left_disp),
+                "right_disp": float(right_disp),
+                "speed_threshold": float(kick_threshold),
+                "disp_threshold": float(displacement_threshold),
+                "left_trigger": bool(left_kick),
+                "right_trigger": bool(right_kick),
+            }
+            return detected, debug
+
+        return detected
 
     def _classify_action(self, static_pose=None):
         """
@@ -670,12 +701,14 @@ class TemporalActionRecognizer:
         
         # Detect specific actions (order matters - check most distinctive first)
         # 1. JUMPING: Feet are moving upward rapidly and body is ascending
-        if  self._feet_are_moving_upward(scale) and body_vy < (-0.2 * effective_scale):
+        body_upward_threshold = min(-0.2 * effective_scale, -0.15)
+        if self._feet_are_moving_upward(scale) and body_vy < body_upward_threshold:
             is_onset = self._mark_action_onset("Jumping")
             logger.info(
-                "Jumping detected. Vy: %.3f, Scale: %.3f, %s",
+                "Jumping detected. Vy: %.3f, Scale: %.3f, body_up_threshold: %.3f, %s",
                 body_vy,
                 scale,
+                body_upward_threshold,
                 self._latency_log_suffix(is_onset),
             )
             return "Jumping"
@@ -683,8 +716,8 @@ class TemporalActionRecognizer:
         # 2. FIGHTING: Any rapid arm strike motion
         # maintain jumping priority over fighting
         if static_pose == "Standing":
-            is_punching = self._detect_arm_strike(scale)
-            is_kicking = self._detect_leg_kick(scale)
+            is_punching, punching_debug = self._detect_arm_strike(scale, return_debug=True)
+            is_kicking, kicking_debug = self._detect_leg_kick(scale, return_debug=True)
             
             # Update attack history
             if is_punching:
@@ -701,16 +734,40 @@ class TemporalActionRecognizer:
             if is_punching:
                 is_onset = self._mark_action_onset("Punching")
                 logger.info(
-                    "Punching detected! Scale: %.2f, %s",
+                    (
+                        "Punching detected! Scale: %.2f, speed_th: %.3f, disp_th: %.3f, "
+                        "L(speed=%.3f, disp=%.3f, trig=%s), "
+                        "R(speed=%.3f, disp=%.3f, trig=%s), %s"
+                    ),
                     scale,
+                    punching_debug["speed_threshold"],
+                    punching_debug["disp_threshold"],
+                    punching_debug["left_speed"],
+                    punching_debug["left_disp"],
+                    punching_debug["left_trigger"],
+                    punching_debug["right_speed"],
+                    punching_debug["right_disp"],
+                    punching_debug["right_trigger"],
                     self._latency_log_suffix(is_onset),
                 )
 
             if is_kicking:
                 is_onset = self._mark_action_onset("Kicking")
                 logger.info(
-                    "Kicking detected! Scale: %.2f, %s",
+                    (
+                        "Kicking detected! Scale: %.2f, speed_th: %.3f, disp_th: %.3f, "
+                        "L(speed=%.3f, disp=%.3f, trig=%s), "
+                        "R(speed=%.3f, disp=%.3f, trig=%s), %s"
+                    ),
                     scale,
+                    kicking_debug["speed_threshold"],
+                    kicking_debug["disp_threshold"],
+                    kicking_debug["left_speed"],
+                    kicking_debug["left_disp"],
+                    kicking_debug["left_trigger"],
+                    kicking_debug["right_speed"],
+                    kicking_debug["right_disp"],
+                    kicking_debug["right_trigger"],
                     self._latency_log_suffix(is_onset),
                 )
             

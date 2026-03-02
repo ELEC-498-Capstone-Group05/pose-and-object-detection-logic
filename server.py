@@ -74,6 +74,7 @@ frame_seq = 0
 latest_frame = None
 yolo_results = None
 yolo_person_present = False
+yolo_no_person_counter = 0
 yolo_result_seq = -1
 movenet_results = None
 movenet_pose_label = "Unknown"
@@ -217,7 +218,7 @@ def movenet_inference_thread():
     """Runs MoveNet inference continuously on TPU 1."""
     global latest_frame, movenet_results, inference_times, stage_times, frame_seq, crop_region
     global movenet_pose_label, movenet_action_label
-    global yolo_person_present, movenet_result_seq
+    global yolo_person_present, movenet_result_seq, yolo_no_person_counter
 
     last_seq = -1
     fps_count = 0
@@ -241,6 +242,12 @@ def movenet_inference_thread():
             person_present = yolo_person_present
 
         if not person_present:
+            yolo_no_person_counter += 1
+            if yolo_no_person_counter % 60 == 0:
+                logger.info(
+                    "MoveNet paused: no person detected by YOLO for %d frames.",
+                    yolo_no_person_counter,
+                )
             with frame_lock:
                 movenet_results = None
                 movenet_pose_label = "Unknown"
@@ -252,6 +259,8 @@ def movenet_inference_thread():
                 stage_times['movenet_invoke'] = 0.0
                 stage_times['movenet_post'] = 0.0
             continue
+
+        yolo_no_person_counter = 0
 
         frame_h, frame_w, _ = frame.shape
 
